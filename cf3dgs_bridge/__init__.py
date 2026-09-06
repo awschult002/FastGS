@@ -21,8 +21,8 @@ license grant. This scaffold is an original FastGS-side integration shell.
 """
 
 from .dataset import SequenceDataset, discover_images
-from .pose_solver import PoseSequence, RelativePoseSE3
-from .progressive import ProgressiveCameraSolver
+from .pose_solver import PoseSequence, RelativePoseSE3, eye4
+from .progressive import ProgressiveCameraSolver, ProgressiveSolveConfig
 from .export_colmap import export_solved_scene_to_colmap
 
 __all__ = [
@@ -30,6 +30,8 @@ __all__ = [
     "discover_images",
     "PoseSequence",
     "RelativePoseSE3",
+    "eye4",
     "ProgressiveCameraSolver",
+    "ProgressiveSolveConfig",
     "export_solved_scene_to_colmap",
 ]
