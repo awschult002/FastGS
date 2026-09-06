@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 
 from .dataset import SequenceDataset
-from .pose_solver import PoseSequence, _eye4
+from .pose_solver import PoseSequence, eye4
 
 
 @dataclass
@@ -18,24 +18,23 @@ class ProgressiveSolveConfig:
     local_iters: int = 1000
     single_step: int = 500  # CF-3DGS: 300 faster / 500 better
     densify_local: bool = False
-    use_monocular_depth: bool = True  # paper uses mono depth cues
-    dry_run: bool = True  # until CUDA training is wired
+    use_monocular_depth: bool = True
+    dry_run: bool = True  # until CUDA photometric solve is wired
 
 
 class ProgressiveCameraSolver:
     """Scaffold for CF-3DGS ``train_from_progressive`` on top of FastGS.
 
-    Upstream CF-3DGS flow (see NVlabs ``trainer/cf3dgs_trainer.py``):
+    Upstream CF-3DGS flow (NVlabs ``trainer/cf3dgs_trainer.py``):
       1. ``init_two_view(0, ...)`` — fit Gaussians on the first frame (pose fixed).
       2. For each next frame ``fidx``: ``add_view_v2(fidx, fidx-1)`` — fit a *local*
          Gaussian model on the previous view, then optimize the relative camera
          of the new view via photometric (+ depth) loss.
-      3. Compose local relatives into a global RT sequence stored on the model.
+      3. Compose local relatives into a global RT sequence.
       4. Optionally refine / evaluate novel views.
 
-    This scaffold implements the control flow and bookkeeping. The photometric
-    local solve that needs CUDA + FastGS rasterizer is intentionally stubbed
-    behind ``dry_run`` so the pipeline can be developed and unit-tested offline.
+    Photometric local solve (needs CUDA + FastGS rasterizer) is stubbed behind
+    ``dry_run`` so the CLI / export path can be developed offline.
     """
 
     def __init__(self, dataset: SequenceDataset, cfg: Optional[ProgressiveSolveConfig] = None):
@@ -60,24 +59,12 @@ class ProgressiveCameraSolver:
         return self.poses
 
     def _init_anchor_view(self, idx: int) -> None:
-        """CF-3DGS ``init_two_view`` analogue: lock frame 0 as world origin."""
         self.poses.set_identity_anchor(idx)
         if self.cfg.dry_run:
             return
-        # TODO: create FastGS GaussianModel from mono-depth / random PCD of frame 0,
-        # optimize appearance with update_cam=False (pose fixed), matching CF-3DGS.
         raise NotImplementedError("Wire FastGS rasterizer + GaussianModel for anchor fit.")
 
     def _estimate_relative_pose(self, prev_idx: int, curr_idx: int) -> np.ndarray:
-        """CF-3DGS ``add_view_v2`` analogue: local model + optimize new camera."""
         if self.cfg.dry_run:
-            # Identity keeps the export path / CLI smoke-testable without GPU.
-            # Replace with SE3 from photometric alignment when implementing for real.
-            return _eye4()
-
-        # TODO outline (non-binding implementation plan):
-        # 1. Build local Gaussians from prev frame (or crop of global model).
-        # 2. Initialize curr camera near prev (small motion prior / identity).
-        # 3. Optimize T_curr_prev with photometric loss (+ optional mono depth).
-        # 4. Grow / merge Gaussians into the global set; store RT for curr_idx.
+            return eye4()
         raise NotImplementedError("Wire relative SE3 photometric solve against FastGS render.")

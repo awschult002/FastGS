@@ -13,13 +13,13 @@ from .pose_solver import PoseSequence
 
 def _write_cameras_txt(path: str, dataset: SequenceDataset) -> None:
     K = dataset.intrinsics
-    # SIMPLE_PINHOLE: camera_id model width height f cx cy
     f = 0.5 * (K.fx + K.fy)
     lines = [
         "# Camera list with one line of data per camera:",
         "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]",
         "# Number of cameras: 1",
-        f"1 SIMPLE_PINHOLE {K.width} {K.height} {f} {K.cx} {K.cy}\n",
+        f"1 SIMPLE_PINHOLE {K.width} {K.height} {f} {K.cx} {K.cy}",
+        "",
     ]
     with open(path, "w", encoding="utf-8") as f_out:
         f_out.write("\n".join(lines))
@@ -27,7 +27,7 @@ def _write_cameras_txt(path: str, dataset: SequenceDataset) -> None:
 
 def _rotation_to_qvec(R: np.ndarray) -> np.ndarray:
     """Convert rotation matrix to COLMAP quaternion (w, x, y, z)."""
-    # Robust-enough conversion for scaffolding; replace with scipy if available.
+    R = np.asarray(R, dtype=np.float64)
     q = np.empty(4, dtype=np.float64)
     trace = np.trace(R)
     if trace > 0.0:
@@ -38,24 +38,14 @@ def _rotation_to_qvec(R: np.ndarray) -> np.ndarray:
         q[3] = (R[1, 0] - R[0, 1]) * s
     else:
         i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
-        j, k = (i + 1) % 3, (i + 2) % 3
-        s = 2.0 * np.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k])
-        q[0] = (R[k, j] - R[j, k]) / s
-        qvec = [0.0, 0.0, 0.0, 0.0]
-        qvec[i + 1] = 0.25 * s
-        qvec[j + 1] = (R[j, i] + R[i, j]) / s
-        qvec[k + 1] = (R[k, i] + R[i, k]) / s
-        q[0], q[1], q[2], q[3] = qvec[0], qvec[1], qvec[2], qvec[3]
-        # Fix assignment properly:
-        q = np.array([qvec[0], qvec[1], qvec[2], qvec[3]], dtype=np.float64)
-        # Actually redo cleanly:
-        q = np.zeros(4, dtype=np.float64)
+        j = (i + 1) % 3
+        k = (i + 2) % 3
+        s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[i, i] - R[j, j] - R[k, k]))
         q[0] = (R[k, j] - R[j, k]) / s
         q[i + 1] = 0.25 * s
         q[j + 1] = (R[j, i] + R[i, j]) / s
         q[k + 1] = (R[k, i] + R[i, k]) / s
-    q = q / np.linalg.norm(q)
-    return q
+    return q / np.linalg.norm(q)
 
 
 def _write_images_txt(path: str, dataset: SequenceDataset, poses: PoseSequence) -> None:
@@ -80,10 +70,10 @@ def _write_images_txt(path: str, dataset: SequenceDataset, poses: PoseSequence) 
 
 
 def _write_points3d_txt(path: str, num_dummy: int = 100) -> None:
-    """Write a tiny random point cloud so FastGS create_from_pcd has something.
+    """Tiny placeholder PCD so FastGS ``create_from_pcd`` has something to load.
 
-    Real CF-3DGS grows Gaussians during progressive solve; once the photometric
-    path is live, replace this with exported Gaussian means / fused PCD.
+    Replace with fused progressive Gaussians / depth back-projection when the
+    photometric solver is live.
     """
     rng = np.random.default_rng(0)
     lines = [
