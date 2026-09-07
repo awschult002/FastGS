@@ -88,7 +88,6 @@ class SiftFallbackSmokeTest(unittest.TestCase):
                 max_features_sift=500,
             )
             seeder = LightGluePoseSeeder(ds, cfg)
-            self.assertEqual(len(poses.T_world_cam) if False else 4, 4)
             self.assertEqual(seeder.backend_name, "sift_fallback")
             poses = seeder.solve()
             self.assertEqual(len(poses.T_world_cam), 4)
