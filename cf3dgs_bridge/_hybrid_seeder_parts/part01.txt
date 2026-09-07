@@ -1,0 +1,263 @@
+            print("[hybrid_seeder] Jump backend skipped; sequential-only DepthPnP")
+
+        # --- 3) Scale-align LightGlue translations to DepthPnP chain ---
+        if jump_edges and cfg.scale_align and adj_rels:
+            jump_edges, ratio = scale_align_lightglue_edges(
+                adj_rels, jump_edges, use_gap_prior=bool(cfg.scale_gap_prior)
+            )
+            self.scale_ratio = ratio
+            print(
+                f"[hybrid_seeder] Scaled {len(jump_edges)} LightGlue jumps "
+                f"(gap_prior={cfg.scale_gap_prior}) median ratio={ratio:.4f}"
+            )
+        else:
+            self.scale_ratio = 1.0
+
+        self.jump_edges = jump_edges
+
+        # --- 4) Fuse: compose chain, optional pose-graph ---
+        c2w = self._compose_from_adjacent(adj_rels)
+        fused: List[ViewGraphEdge] = list(seq_edges) + list(jump_edges)
+
+        if cfg.pose_graph and fused:
+            pg_edges = self._to_pose_graph_edges(seq_edges, jump_edges)
+            if pg_edges:
+                try:
+                    cost_before = None
+                    from .pose_graph import pose_graph_cost
+
+                    cost_before = pose_graph_cost(c2w, pg_edges)
+                    c2w = optimize_pose_graph(
+                        c2w, pg_edges, max_nfev=cfg.pose_graph_max_nfev
+                    )
+                    cost_after = pose_graph_cost(c2w, pg_edges)
+                    print(
+                        f"[hybrid_seeder] Pose-graph on {len(pg_edges)} edges "
+                        f"(depth_w={cfg.depth_pnp_weight}, lg_w={cfg.lightglue_weight}): "
+                        f"cost {cost_before:.4f} → {cost_after:.4f}"
+                    )
+                except Exception as exc:
+                    print(f"[hybrid_seeder] Pose-graph failed ({exc}); keeping chain")
+
+        self.backend_name = (
+            "hybrid_depth_pnp+lightglue" if self.used_lightglue and jump_edges else "hybrid_depth_pnp"
+        )
+        self.poses = PoseSequence(num_frames=n)
+        self.poses.T_world_cam = [np.asarray(T, dtype=np.float64).copy() for T in c2w]
+        self.poses.set_identity_anchor(0)
+        for i in range(n - 1):
+            T_ip1_i = invert_T(c2w[i + 1]) @ c2w[i]
+            self.poses.set_relative(i, i + 1, T_ip1_i)
+        for e in fused:
+            if e.j != e.i + 1:
+                self.poses.set_relative(e.i, e.j, e.T_j_i)
+
+        print(
+            f"[hybrid_seeder] Done: backend={self.backend_name}, "
+            f"seq_edges={len(seq_edges)}, jump_edges={len(jump_edges)}, "
+            f"scale_ratio={self.scale_ratio:.4f}"
+        )
+        return self.poses
+
+    def _compose_from_adjacent(self, adj_rels: Sequence[np.ndarray]) -> List[np.ndarray]:
+        n = len(adj_rels) + 1
+        poses = [eye4() for _ in range(n)]
+        for i, T_ip1_i in enumerate(adj_rels):
+            poses[i + 1] = poses[i] @ invert_T(T_ip1_i)
+        return poses
+
+    def _to_pose_graph_edges(
+        self,
+        seq_edges: Sequence[ViewGraphEdge],
+        jump_edges: Sequence[ViewGraphEdge],
+    ) -> List[PoseGraphEdge]:
+        cfg = self.cfg
+        out: List[PoseGraphEdge] = []
+        for e in seq_edges:
+            if e.inliers <= 0:
+                continue
+            w = float(cfg.depth_pnp_weight) * float(max(e.inliers, 1))
+            out.append(PoseGraphEdge(i=e.i, j=e.j, T_j_i=e.T_j_i, weight=w))
+        # Soft loop-closures: prefer true long-range gaps in the pose-graph
+        min_gap = int(cfg.min_jump_gap_for_pg)
+        if min_gap <= 0:
+            min_gap = max(2, int(cfg.long_range_stride or 2))
+        n_lg_pg = 0
+        for e in jump_edges:
+            if e.inliers < self.cfg.min_inliers:
+                continue
+            if (e.j - e.i) < min_gap:
+                continue
+            w = float(cfg.lightglue_weight) * float(max(e.inliers, 1))
+            out.append(PoseGraphEdge(i=e.i, j=e.j, T_j_i=e.T_j_i, weight=w))
+            n_lg_pg += 1
+        print(
+            f"[hybrid_seeder] Pose-graph LightGlue edges: {n_lg_pg}/{len(jump_edges)} "
+            f"(min_gap={min_gap})"
+        )
+        return out
+
+    def _build_sequential_edges(
+        self,
+    ) -> Tuple[List[np.ndarray], List[ViewGraphEdge]]:
+        """Run DepthPnP adjacent VO; optionally add ±2..radius skip PnP edges."""
+        cfg = self.cfg
+        depth_cfg = DepthPnPSolveConfig(
+            resize_width=cfg.resize_width,
+            feature_backend=cfg.depth_feature_backend,
+            max_features=cfg.max_features,
+            min_matches=cfg.min_matches,
+            pose_graph=False,
+            photo_refine=False,
+        )
+        solver = DepthPnPProgressiveSolver(self.dataset, self.depth_paths, depth_cfg)
+        poses = solver.solve()
+        n = len(self.dataset)
+        adj_rels: List[np.ndarray] = []
+        edges: List[ViewGraphEdge] = []
+        for i in range(n - 1):
+            key = (i, i + 1)
+            if key in poses.relatives:
+                T = np.asarray(poses.relatives[key].T_dst_src, dtype=np.float64).copy()
+            else:
+                T = invert_T(poses.T_world_cam[i + 1]) @ poses.T_world_cam[i]
+            adj_rels.append(T)
+            edges.append(
+                ViewGraphEdge(
+                    i=i,
+                    j=i + 1,
+                    T_j_i=T,
+                    inliers=100,  # adjacent metric preferred
+                    num_matches=100,
+                )
+            )
+
+        radius = max(1, int(cfg.sequential_radius))
+        if radius >= 2:
+            skip_edges = self._depth_pnp_skip_edges(radius)
+            edges.extend(skip_edges)
+            print(f"[hybrid_seeder] Added {len(skip_edges)} DepthPnP skip edges (d=2..{radius})")
+
+        return adj_rels, edges
+
+    def _depth_pnp_skip_edges(self, radius: int) -> List[ViewGraphEdge]:
+        """Compute DepthPnP relatives for (i, i+d), d=2..radius."""
+        cfg = self.cfg
+        n = len(self.dataset)
+        feat_cfg = OpenCVSolveConfig(
+            max_features=cfg.max_features,
+            feature_backend=cfg.depth_feature_backend,
+        )
+        detector, bf, _name = _create_feature_backend(feat_cfg)
+        K_full = self.dataset.intrinsics.as_K()
+
+        # Cache gray + depth + features
+        grays: List[np.ndarray] = []
+        scales: List[float] = []
+        kps = []
+        dess = []
+        depths: List[Optional[np.ndarray]] = []
+        for i in range(n):
+            img, scale = _load_gray(self.dataset.image_paths[i], cfg.resize_width)
+            kp, des = detector.detectAndCompute(img, None)
+            grays.append(img)
+            scales.append(scale)
+            kps.append(kp)
+            dess.append(des)
+            dpath = self.depth_paths[i]
+            if dpath is None:
+                depths.append(None)
+            else:
+                d = load_depth_npz(dpath)
+                depths.append(resize_depth(d, img.shape[1], img.shape[0]))
+
+        edges: List[ViewGraphEdge] = []
+        depth_cfg = DepthPnPSolveConfig(
+            min_matches=cfg.min_matches,
+            match_ratio=0.75,
+            min_depth=1e-3,
+            max_depth=80.0,
+        )
+        for i in range(n):
+            for d in range(2, radius + 1):
+                j = i + d
+                if j >= n:
+                    break
+                if dess[i] is None or dess[j] is None or depths[i] is None:
+                    continue
+                K = _scaled_K(K_full, scales[i])
+                T, n_inl = self._pnp_relative(
+                    kps[i],
+                    dess[i],
+                    kps[j],
+                    dess[j],
+                    depths[i],
+                    K,
+                    bf,
+                    depth_cfg,
+                )
+                if n_inl < cfg.min_inliers:
+                    continue
+                edges.append(
+                    ViewGraphEdge(
+                        i=i, j=j, T_j_i=T, inliers=int(n_inl), num_matches=int(n_inl)
+                    )
+                )
+                print(
+                    f"[hybrid_seeder] DepthPnP skip {i:03d}→{j:03d} "
+                    f"inliers={n_inl} t_norm={np.linalg.norm(T[:3, 3]):.4f}"
+                )
+        return edges
+
+    @staticmethod
+    def _pnp_relative(
+        kp1,
+        des1,
+        kp2,
+        des2,
+        depth1: np.ndarray,
+        K: np.ndarray,
+        bf,
+        cfg: DepthPnPSolveConfig,
+    ) -> Tuple[np.ndarray, int]:
+        good = _good_matches(bf, des1, des2, cfg.match_ratio)
+        if len(good) < cfg.min_matches:
+            return eye4(), 0
+        pts1 = np.float64([kp1[m.queryIdx].pt for m in good])
+        pts2 = np.float64([kp2[m.trainIdx].pt for m in good])
+        pts3d, valid = unproject_pixels(pts1, depth1, K, cfg.min_depth, cfg.max_depth)
+        if int(valid.sum()) < cfg.min_matches:
+            return eye4(), 0
+        obj = pts3d[valid]
+        img_pts = pts2[valid]
+        try:
+            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                obj.astype(np.float64),
+                img_pts.astype(np.float64),
+                K,
+                None,
+                iterationsCount=cfg.ransac_iters,
+                reprojectionError=cfg.reproj_err,
+                confidence=cfg.confidence,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except Exception:
+            return eye4(), 0
+        if not ok or rvec is None or tvec is None:
+            return eye4(), 0
+        R, _ = cv2.Rodrigues(rvec)
+        T = eye4()
+        T[:3, :3] = R
+        T[:3, 3] = tvec.reshape(3)
+        n_inl = int(len(inliers)) if inliers is not None else 0
+        return T, n_inl
+
+    def _build_lightglue_jumps(self) -> List[ViewGraphEdge]:
+        """Run LightGlue on jump pairs only; return ViewGraphEdge list."""
+        cfg = self.cfg
+        n = len(self.dataset)
+        pairs = jump_pairs_only(
+            n,
+            sequential_radius=cfg.sequential_radius,
+            pair_radius=cfg.pair_radius,
+            long_range_stride=cfg.long_range_stride,
