@@ -1,0 +1,72 @@
+        )
+        if not pairs:
+            print("[hybrid_seeder] No jump pairs to match with LightGlue")
+            return []
+
+        # Build a LightGlue seeder; we only consume its matcher + relative pose.
+        # Disable scale_t_by_frame_gap — hybrid scale-align handles metric.
+        lg_cfg = LightGlueSeedConfig(
+            pair_radius=1,  # unused; we drive pairs ourselves
+            long_range_stride=0,
+            resize_width=cfg.resize_width,
+            max_keypoints=cfg.max_keypoints,
+            feature_backend=cfg.feature_backend,
+            device=cfg.device,
+            pose_graph=False,
+            scale_t_by_frame_gap=False,
+            min_matches=cfg.min_matches,
+            min_inliers=cfg.min_inliers,
+        )
+        seeder = LightGluePoseSeeder(self.dataset, lg_cfg)
+        print(
+            f"[hybrid_seeder] LightGlue jumps: {len(pairs)} pairs "
+            f"(backend={seeder.backend_name}, device={seeder.device})"
+        )
+
+        K_full = self.dataset.intrinsics.as_K()
+        edges: List[ViewGraphEdge] = []
+        for i, j in pairs:
+            path_i = self.dataset.image_paths[i]
+            path_j = self.dataset.image_paths[j]
+            probe = cv2.imread(path_i, cv2.IMREAD_COLOR)
+            if probe is None:
+                raise FileNotFoundError(path_i)
+            orig_w = probe.shape[1]
+            if cfg.resize_width is not None and orig_w > cfg.resize_width:
+                scale = cfg.resize_width / float(orig_w)
+            else:
+                scale = 1.0
+            K = _scaled_K(K_full, scale)
+            pts_i, pts_j, n_matches = seeder.matcher.match_pair(path_i, path_j, K)
+            if n_matches < cfg.min_matches or pts_i.shape[0] < cfg.min_matches:
+                print(f"[hybrid_seeder] LG {i:03d}→{j:03d} matches={n_matches} (skip)")
+                continue
+            T, n_inl = seeder._relative_pose(pts_i, pts_j, K)
+            tag = "ok" if n_inl >= cfg.min_inliers else "weak"
+            print(
+                f"[hybrid_seeder] LG {i:03d}→{j:03d} matches={n_matches} "
+                f"inliers={n_inl} ({tag}) t_norm={np.linalg.norm(T[:3, 3]):.4f}"
+            )
+            if n_inl > 0:
+                edges.append(
+                    ViewGraphEdge(
+                        i=i,
+                        j=j,
+                        T_j_i=T,
+                        inliers=int(n_inl),
+                        num_matches=int(n_matches),
+                    )
+                )
+        return edges
+
+
+__all__ = [
+    "HybridSeedConfig",
+    "HybridPoseSeeder",
+    "estimate_lightglue_scale_ratio",
+    "apply_frame_gap_translation_prior",
+    "scale_edge_translations",
+    "scale_align_lightglue_edges",
+    "compose_chain_relative",
+    "jump_pairs_only",
+]
