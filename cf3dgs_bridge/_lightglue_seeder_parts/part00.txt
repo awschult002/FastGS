@@ -1,0 +1,311 @@
+"""Learned matching pose seeder: SuperPoint/ALIKED + LightGlue → view graph → SE3.
+
+Product role
+------------
+Feed-forward COLMAP-free models struggle on large camera jumps. This module
+builds a robust *seed* trajectory from learned matches (vid2scene / hloc-style):
+
+1. Extract local features (SuperPoint preferred; ALIKED if available).
+2. Match with LightGlue on sequential ±k pairs and optional long-range pairs.
+3. Recover relative SE(3) via essential matrix (OpenCV 5-aware).
+4. Compose a global ``PoseSequence`` from a max-inlier spanning tree, then
+   optionally refine with the existing SE(3) pose-graph optimizer.
+
+Translations from essential matrices are unit-scale; Umeyama / later depth or
+photometric refine absorbs metric scale. Graceful SIFT fallback when LightGlue
+or torch weights are unavailable.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import cv2
+import numpy as np
+
+from .dataset import SequenceDataset
+from .opencv_solver import recover_pose_opencv5
+from .pose_graph import PoseGraphEdge, invert_T, optimize_pose_graph
+from .pose_solver import PoseSequence, eye4
+
+Pair = Tuple[int, int]
+
+
+@dataclass
+class ViewGraphEdge:
+    """Relative SE(3) measurement between cameras i → j (points i → j)."""
+
+    i: int
+    j: int
+    T_j_i: np.ndarray
+    inliers: int
+    num_matches: int = 0
+
+    def __post_init__(self) -> None:
+        self.T_j_i = np.asarray(self.T_j_i, dtype=np.float64)
+        assert self.T_j_i.shape == (4, 4)
+
+
+@dataclass
+class LightGlueSeedConfig:
+    pair_radius: int = 1
+    """Sequential pairs (i, i+d) for d = 1..pair_radius."""
+
+    long_range_stride: int = 0
+    """If > 0, add every-Nth keyframe pairs for large jumps (retrieval stub)."""
+
+    max_keypoints: int = 2048
+    feature_backend: str = "superpoint"  # superpoint | aliked | auto | sift
+    device: str = "auto"  # auto | cpu | cuda
+    resize_width: Optional[int] = 960
+    min_matches: int = 30
+    min_inliers: int = 15
+    scale_t_by_frame_gap: bool = True
+    """Scale unit essential translation by |j-i| (constant-velocity prior)."""
+    ransac_prob: float = 0.999
+    ransac_threshold: float = 1.0
+    pose_graph: bool = False  # unit-scale essential edges fight in SE3 PG; opt-in
+    pose_graph_max_nfev: int = 80
+    match_ratio: float = 0.75  # SIFT Lowe ratio (fallback only)
+    max_features_sift: int = 4000
+
+
+def resolve_device(requested: str = "auto") -> str:
+    req = (requested or "auto").lower().strip()
+    if req == "cpu":
+        return "cpu"
+    if req == "cuda":
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    # auto
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def lightglue_available(feature_backend: str = "superpoint") -> bool:
+    """True if LightGlue + requested extractor can be imported (weights later)."""
+    try:
+        import importlib
+
+        importlib.import_module("lightglue.lightglue")
+        fb = (feature_backend or "superpoint").lower().strip()
+        if fb in ("superpoint", "auto"):
+            importlib.import_module("lightglue.superpoint")
+            return True
+        if fb == "aliked":
+            try:
+                importlib.import_module("lightglue.aliked")
+                return True
+            except Exception:
+                # torchvision / ALIKED often broken; treat as unavailable
+                return False
+        if fb == "sift":
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def build_pairs(
+    n: int,
+    pair_radius: int = 1,
+    long_range_stride: int = 0,
+) -> List[Pair]:
+    """Build (i, j) pairs with i < j: sequential ±k and optional every-Nth long-range."""
+    pairs: Set[Pair] = set()
+    radius = max(1, int(pair_radius))
+    for i in range(n):
+        for d in range(1, radius + 1):
+            j = i + d
+            if j < n:
+                pairs.add((i, j))
+    stride = int(long_range_stride or 0)
+    if stride > 0:
+        # Adjacent keyframes every `stride` frames (large-jump bridges).
+        keyframes = list(range(0, n, stride))
+        if keyframes[-1] != n - 1:
+            keyframes.append(n - 1)
+        for a, b in zip(keyframes, keyframes[1:]):
+            if a < b:
+                pairs.add((a, b))
+        # Also connect each frame to the frame +stride away (dense long-range).
+        for i in range(n):
+            j = i + stride
+            if j < n:
+                pairs.add((i, j))
+    return sorted(pairs)
+
+
+def _union_find(n: int):
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> bool:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return False
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+        return True
+
+    return find, union
+
+
+def spanning_tree_edges(
+    edges: Sequence[ViewGraphEdge],
+    n: int,
+) -> List[ViewGraphEdge]:
+    """Kruskal MST preferring *highest* inlier counts (maximum spanning tree)."""
+    ordered = sorted(edges, key=lambda e: (e.inliers, e.num_matches), reverse=True)
+    find, union = _union_find(n)
+    chosen: List[ViewGraphEdge] = []
+    for e in ordered:
+        if e.inliers <= 0:
+            continue
+        if union(e.i, e.j):
+            chosen.append(e)
+        if len(chosen) >= n - 1:
+            break
+    return chosen
+
+
+def compose_poses_from_tree(
+    n: int,
+    tree_edges: Sequence[ViewGraphEdge],
+    anchor: int = 0,
+) -> List[np.ndarray]:
+    """BFS compose c2w from spanning-tree relatives (frame ``anchor`` = I)."""
+    adj: Dict[int, List[Tuple[int, np.ndarray]]] = {i: [] for i in range(n)}
+    for e in tree_edges:
+        # T_j_i maps points i → j; c2w: T_w_j = T_w_i @ inv(T_j_i)
+        adj[e.i].append((e.j, e.T_j_i))
+        adj[e.j].append((e.i, invert_T(e.T_j_i)))
+
+    poses = [None] * n  # type: ignore
+    poses[anchor] = eye4()
+    stack = [anchor]
+    while stack:
+        u = stack.pop()
+        Tu = poses[u]
+        assert Tu is not None
+        for v, T_v_u in adj[u]:
+            if poses[v] is not None:
+                continue
+            poses[v] = Tu @ invert_T(T_v_u)
+            stack.append(v)
+
+    # Unreachable frames stay identity (degenerate); warn via None → eye
+    out: List[np.ndarray] = []
+    for i in range(n):
+        if poses[i] is None:
+            out.append(eye4())
+        else:
+            out.append(np.asarray(poses[i], dtype=np.float64))
+    return out
+
+
+def _scaled_K(K: np.ndarray, scale: float) -> np.ndarray:
+    K2 = K.copy()
+    K2[0, 0] *= scale
+    K2[1, 1] *= scale
+    K2[0, 2] *= scale
+    K2[1, 2] *= scale
+    return K2
+
+
+def _load_bgr(path: str, resize_width: Optional[int]) -> Tuple[np.ndarray, float]:
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(path)
+    scale = 1.0
+    if resize_width is not None and img.shape[1] > resize_width:
+        scale = resize_width / float(img.shape[1])
+        img = cv2.resize(img, (resize_width, int(round(img.shape[0] * scale))))
+    return img, scale
+
+
+class _SiftMatcher:
+    """OpenCV SIFT+BF fallback when LightGlue / weights are unavailable."""
+
+    def __init__(self, cfg: LightGlueSeedConfig):
+        self.cfg = cfg
+        self.detector = cv2.SIFT_create(nfeatures=cfg.max_features_sift)
+        self.bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        self.name = "sift_fallback"
+
+    def match_pair(
+        self, path0: str, path1: str, K: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        img0, s0 = _load_bgr(path0, self.cfg.resize_width)
+        img1, s1 = _load_bgr(path1, self.cfg.resize_width)
+        g0 = cv2.cvtColor(img0, cv2.COLOR_BGR2GRAY)
+        g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        kp0, des0 = self.detector.detectAndCompute(g0, None)
+        kp1, des1 = self.detector.detectAndCompute(g1, None)
+        if des0 is None or des1 is None:
+            return np.zeros((0, 2)), np.zeros((0, 2)), 0
+        knn = self.bf.knnMatch(des0, des1, k=2)
+        good = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < self.cfg.match_ratio * n.distance:
+                good.append(m)
+        if len(good) < self.cfg.min_matches:
+            return np.zeros((0, 2)), np.zeros((0, 2)), 0
+        pts0 = np.float64([kp0[m.queryIdx].pt for m in good])
+        pts1 = np.float64([kp1[m.trainIdx].pt for m in good])
+        # K already expected at resized scale by caller
+        return pts0, pts1, len(good)
+
+
+class _LightGlueMatcher:
+    """SuperPoint (or ALIKED) + LightGlue matcher with feature cache."""
+
+    def __init__(self, cfg: LightGlueSeedConfig, device: str, backend_name: str):
+        import importlib
+
+        import torch
+
+        self.cfg = cfg
+        self.device = device
+        self.torch = torch
+        self.utils = importlib.import_module("lightglue.utils")
+        lg_mod = importlib.import_module("lightglue.lightglue")
+        LightGlue = lg_mod.LightGlue
+
+        fb = backend_name
+        if fb == "aliked":
+            aliked_mod = importlib.import_module("lightglue.aliked")
+            Extractor = aliked_mod.ALIKED
+            features = "aliked"
+        else:
+            sp_mod = importlib.import_module("lightglue.superpoint")
+            Extractor = sp_mod.SuperPoint
+            features = "superpoint"
+            fb = "superpoint"
+
+        self.extractor = Extractor(max_num_keypoints=cfg.max_keypoints).eval().to(device)
+        self.matcher = LightGlue(features=features).eval().to(device)
