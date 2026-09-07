@@ -1,0 +1,95 @@
+            photo = loss_acc / float(len(view_ids))
+            prior = _pose_prior()
+            loss = photo + prior
+            loss.backward()
+            opt_g.step()
+            if it >= gauss_only_until and opt_p is not None:
+                opt_p.step()
+                _clamp_poses()
+            with torch.no_grad():
+                self.G_global.quats.copy_(quat_normalize(self.G_global.quats))
+
+            loss_f = float(photo.detach())
+            # Accept pose update only if within clamp (already enforced) and photo improves
+            # or stays near best; always prefer lower photo among feasible poses.
+            if loss_f < best_loss:
+                best_loss = loss_f
+                best_poses = {j: pose_params[j].numpy() for j in opt_ids}
+                best_gauss_state = _snapshot_gauss()
+
+            if cfg.log_every and (it % cfg.log_every == 0 or it == cfg.global_iters - 1):
+                phase = "gauss" if it < gauss_only_until else "joint"
+                print(
+                    f"  [global {upto_idx}] iter {it:03d}/{cfg.global_iters} "
+                    f"photo={loss_f:.4f} prior={float(prior.detach()):.4f} "
+                    f"best={best_loss:.4f} phase={phase} views={view_ids} N={m.shape[0]}"
+                )
+
+        if best_gauss_state is not None:
+            _restore_gauss(best_gauss_state)
+        for j, T in best_poses.items():
+            self.poses.T_world_cam[j] = _orthonormalize_se3(T)
+
+    def solve(self) -> PoseSequence:
+        n = len(self.dataset)
+        if n < 2:
+            raise ValueError("Need >= 2 frames")
+        cfg = self.cfg
+        missing = sum(1 for p in self.depth_paths if p is None)
+        if missing:
+            print(f"[progressive_global] WARNING: {missing}/{n} frames missing depth")
+
+        print(
+            f"[progressive_global] Local+global on {n} frames "
+            f"(fit={cfg.fit_iters}, pose={cfg.pose_iters}, global={cfg.global_iters}, "
+            f"pose_window={cfg.pose_window}, maxG={cfg.max_global_gaussians}, "
+            f"width={cfg.resize_width}, device={cfg.device})"
+        )
+
+        local_solver = LocalFrozenGaussSolver(
+            self.dataset, self.depth_paths, self._local_cfg()
+        )
+        warm = (
+            local_solver._warm_start_relatives()
+            if cfg.warm_start_depth_pnp
+            else {}
+        )
+
+        self.poses.set_identity_anchor(0)
+        # Init world Gaussians from frame 0
+        self._ensure_frame_tensors(0)
+        self._init_global_from_frame0()
+
+        for i in range(1, n):
+            T_init = warm.get((i - 1, i), eye4())
+            T_rel = local_solver.estimate_relative(i - 1, i, T_init=T_init)
+            T_rel = _orthonormalize_se3(T_rel)
+            self.poses.set_relative(i - 1, i, T_rel)
+            # Extend global pose without recomposing earlier refined frames
+            self.poses.T_world_cam[i] = _orthonormalize_se3(
+                self.poses.T_world_cam[i - 1] @ _invert_se3(T_rel)
+            )
+            tnorm = float(np.linalg.norm(T_rel[:3, 3]))
+            print(f"[progressive_global] local {i-1:03d}→{i:03d} t_norm={tnorm:.4f}")
+
+            if cfg.densify_every > 0 and (i % cfg.densify_every == 0):
+                self._densify_from_frame(i, self.poses.T_world_cam[i])
+
+            if cfg.global_iters > 0:
+                self._joint_optimize(i)
+                # Orthonormalize refined poses; sync relatives for export (no recompose)
+                for j in range(i + 1):
+                    self.poses.T_world_cam[j] = _orthonormalize_se3(
+                        self.poses.T_world_cam[j]
+                    )
+                rels = _c2w_list_to_relatives(self.poses.T_world_cam[: i + 1])
+                for (a, b), T in rels.items():
+                    self.poses.set_relative(a, b, _orthonormalize_se3(T))
+
+        return self.poses
+
+
+__all__ = [
+    "ProgressiveGlobalConfig",
+    "ProgressiveGlobalSolver",
+]
