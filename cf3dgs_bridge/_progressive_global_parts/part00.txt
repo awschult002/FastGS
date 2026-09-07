@@ -1,0 +1,283 @@
+"""Progressive global joint Gaussian + pose growth (CF-3DGS §3.3).
+
+After each local frozen relative pose for a new frame, maintain a **world-frame**
+Gaussian set ``G_global`` and jointly refine Gaussians + recent SE(3) poses
+against multiple views via soft_splat photometric loss.
+
+Re-implements the *technique* from Fu et al. (CF-3DGS); does **not** copy
+NVlabs source. CPU-friendly defaults (soft_splat, capped Gaussians, pose window).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .dataset import SequenceDataset
+from .depth_pnp_solver import load_depth_npz, resize_depth
+from .local_frozen_gauss import (
+    LocalFrozenGaussConfig,
+    LocalFrozenGaussSolver,
+    _LocalGaussParams,
+    _PoseParams,
+    _load_rgb,
+    _scaled_K,
+    depth_to_local_gaussians,
+)
+from .pose_solver import PoseSequence, eye4
+from .soft_splat import (
+    photometric_loss,
+    quat_normalize,
+    transform_points,
+    try_fastgs_rasterizer,
+)
+
+
+@dataclass
+class ProgressiveGlobalConfig:
+    """Hyperparameters for local + progressive global joint growth."""
+
+    # Local frozen stage (per adjacent edge)
+    fit_iters: int = 80
+    pose_iters: int = 60
+    lr_gauss: float = 2e-2
+    lr_pose: float = 1e-2
+    downsample: int = 6
+    resize_width: int = 320
+    device: str = "cpu"
+    lambda_dssim: float = 0.2
+    min_depth: float = 1e-3
+    max_depth: float = 80.0
+    depth_key: str = "pred"
+    bg_color: float = 0.0
+    warm_start_depth_pnp: bool = True
+    isotropic: bool = True
+    splat_mode: str = "soft"
+    max_local_gaussians: int = 2500
+    opacity_init: float = 0.7
+    scale_mult: float = 0.6
+    log_every: int = 40
+    pose_max_trans_ratio: float = 2.5
+    pose_max_rot_rad: float = 0.15
+    keep_best_pose: bool = True
+
+    # Global joint stage
+    global_iters: int = 40
+    pose_window: int = 3  # optimize last K poses (frame 0 always frozen)
+    densify_every: int = 1
+    max_global_gaussians: int = 6000
+    densify_stride: int = 8
+    densify_max_new: int = 1000
+    init_fit_iters: int = 40  # brief fit of G_global on frame 0
+    lr_gauss_global: float = 1e-2
+    lr_pose_global: float = 1e-3
+    # Views used in global photometric loss: optimizable window + this many older frozen views
+    frozen_view_support: int = 1
+    prune_opacity_floor: float = 0.02
+    # Stay close to local-composed poses (soft_splat gradients are noisy on CPU)
+    pose_prior_trans: float = 5.0
+    pose_prior_rot: float = 2.0
+    pose_max_trans_delta: float = 0.05  # meters in local depth units
+    pose_max_rot_delta: float = 0.08  # ~4.6 deg from local init
+    gauss_only_iters_frac: float = 0.4  # first fraction: Gaussians only, poses frozen
+
+
+def _invert_se3(T: np.ndarray) -> np.ndarray:
+    T = np.asarray(T, dtype=np.float64)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    Ti = np.eye(4, dtype=np.float64)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+    return Ti
+
+
+def _orthonormalize_se3(T: np.ndarray) -> np.ndarray:
+    """Project rotation to SO(3) via SVD; keep translation if finite."""
+    T = np.asarray(T, dtype=np.float64).copy()
+    if not np.isfinite(T).all():
+        return eye4()
+    R = T[:3, :3]
+    try:
+        U, _, Vt = np.linalg.svd(R)
+        R_o = U @ Vt
+        if np.linalg.det(R_o) < 0:
+            U[:, -1] *= -1
+            R_o = U @ Vt
+    except np.linalg.LinAlgError:
+        return eye4()
+    T[:3, :3] = R_o
+    if not np.isfinite(T[:3, 3]).all():
+        T[:3, 3] = 0.0
+    return T
+
+
+def _c2w_list_to_relatives(T_world_cam: List[np.ndarray]) -> Dict[Tuple[int, int], np.ndarray]:
+    """Recover adjacent T_dst_src from c2w sequence: T_{i+1←i} = inv(c2w_{i+1}) @ c2w_i."""
+    out = {}
+    for i in range(len(T_world_cam) - 1):
+        out[(i, i + 1)] = _invert_se3(T_world_cam[i + 1]) @ T_world_cam[i]
+    return out
+
+
+def _pack_detach(gauss: _LocalGaussParams):
+    m, c, o, s, q = gauss.packed()
+    return m.detach(), c.detach(), o.detach(), s.detach(), q.detach()
+
+
+def _cap_gaussians(
+    means: torch.Tensor,
+    colors: torch.Tensor,
+    log_scales: torch.Tensor,
+    opacity_logit: torch.Tensor,
+    quats: torch.Tensor,
+    max_n: int,
+    opacity_floor: float = 0.02,
+) -> Tuple[torch.Tensor, ...]:
+    """Prune low opacity then random/linspace subsample to ``max_n``."""
+    n = means.shape[0]
+    if n == 0:
+        return means, colors, log_scales, opacity_logit, quats
+    with torch.no_grad():
+        opac = torch.sigmoid(opacity_logit)
+        keep = opac >= opacity_floor
+        if int(keep.sum().item()) < max(16, max_n // 8):
+            # Too aggressive — keep top by opacity
+            k = min(n, max_n)
+            idx = torch.argsort(opac, descending=True)[:k]
+        else:
+            idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
+            if idx.numel() > max_n:
+                # linspace subsample for stability (deterministic)
+                sel = torch.linspace(0, idx.numel() - 1, max_n).long()
+                idx = idx[sel]
+        means = means[idx]
+        colors = colors[idx]
+        log_scales = log_scales[idx]
+        opacity_logit = opacity_logit[idx]
+        quats = quats[idx]
+    return means, colors, log_scales, opacity_logit, quats
+
+
+def _append_gaussians(
+    gauss: Optional[_LocalGaussParams],
+    means: torch.Tensor,
+    colors: torch.Tensor,
+    log_scales: torch.Tensor,
+    opacity_logit: torch.Tensor,
+    quats: torch.Tensor,
+    max_n: int,
+    opacity_floor: float,
+) -> _LocalGaussParams:
+    if gauss is None:
+        m, c, ls, ol, q = _cap_gaussians(
+            means, colors, log_scales, opacity_logit, quats, max_n, opacity_floor
+        )
+        return _LocalGaussParams(m, c, ls, ol, q)
+    with torch.no_grad():
+        m0, c0, o0, s0, q0 = gauss.packed()
+        # Rebuild from current packed + log params
+        means_cat = torch.cat([gauss.means.detach(), means.detach()], dim=0)
+        colors_cat = torch.cat([gauss.colors.detach(), colors.detach()], dim=0)
+        log_scales_cat = torch.cat([gauss.log_scales.detach(), log_scales.detach()], dim=0)
+        opacity_logit_cat = torch.cat(
+            [gauss.opacity_logit.detach(), opacity_logit.detach()], dim=0
+        )
+        quats_cat = torch.cat([gauss.quats.detach(), quats.detach()], dim=0)
+    m, c, ls, ol, q = _cap_gaussians(
+        means_cat, colors_cat, log_scales_cat, opacity_logit_cat, quats_cat, max_n, opacity_floor
+    )
+    return _LocalGaussParams(m, c, ls, ol, q)
+
+
+class ProgressiveGlobalSolver:
+    """Local frozen edge + progressive world Gaussian / pose joint growth."""
+
+    def __init__(
+        self,
+        dataset: SequenceDataset,
+        depth_paths: List[Optional[str]],
+        cfg: Optional[ProgressiveGlobalConfig] = None,
+    ):
+        self.dataset = dataset
+        self.depth_paths = depth_paths
+        self.cfg = cfg or ProgressiveGlobalConfig()
+        if len(depth_paths) != len(dataset):
+            raise ValueError(
+                f"depth_paths length {len(depth_paths)} != num frames {len(dataset)}"
+            )
+        self.poses = PoseSequence(num_frames=len(dataset))
+        self.device = torch.device(self.cfg.device)
+        self.backend_name = "progressive_global_softsplat"
+        self.G_global: Optional[_LocalGaussParams] = None
+        self._rgb_cache: Dict[int, torch.Tensor] = {}
+        self._K_t: Optional[torch.Tensor] = None
+        self._hw: Optional[Tuple[int, int]] = None
+        self._scale: float = 1.0
+
+    def _local_cfg(self) -> LocalFrozenGaussConfig:
+        c = self.cfg
+        return LocalFrozenGaussConfig(
+            fit_iters=c.fit_iters,
+            pose_iters=c.pose_iters,
+            lr_gauss=c.lr_gauss,
+            lr_pose=c.lr_pose,
+            downsample=c.downsample,
+            resize_width=c.resize_width,
+            device=c.device,
+            lambda_dssim=c.lambda_dssim,
+            min_depth=c.min_depth,
+            max_depth=c.max_depth,
+            depth_key=c.depth_key,
+            bg_color=c.bg_color,
+            warm_start_depth_pnp=c.warm_start_depth_pnp,
+            isotropic=c.isotropic,
+            splat_mode=c.splat_mode,
+            max_gaussians=c.max_local_gaussians,
+            opacity_init=c.opacity_init,
+            scale_mult=c.scale_mult,
+            log_every=c.log_every,
+            pose_max_trans_ratio=c.pose_max_trans_ratio,
+            pose_max_rot_rad=c.pose_max_rot_rad,
+            keep_best_pose=c.keep_best_pose,
+        )
+
+    def _ensure_frame_tensors(self, idx: int) -> Tuple[torch.Tensor, np.ndarray, float]:
+        """Load RGB (cached as CHW tensor) and return (rgb_t, K_np, scale)."""
+        cfg = self.cfg
+        device = self.device
+        if idx not in self._rgb_cache:
+            rgb, scale = _load_rgb(self.dataset.image_paths[idx], cfg.resize_width)
+            if self._hw is None:
+                self._hw = (rgb.shape[0], rgb.shape[1])
+                self._scale = scale
+                K_full = self.dataset.intrinsics.as_K()
+                K = _scaled_K(K_full, scale)
+                self._K_t = torch.tensor(K, device=device, dtype=torch.float32)
+            else:
+                assert rgb.shape[:2] == self._hw, (rgb.shape[:2], self._hw)
+            self._rgb_cache[idx] = torch.tensor(
+                rgb.transpose(2, 0, 1), device=device, dtype=torch.float32
+            )
+        assert self._K_t is not None and self._hw is not None
+        K_np = self._K_t.detach().cpu().numpy().astype(np.float64)
+        return self._rgb_cache[idx], K_np, self._scale
+
+    def _lift_frame_world(
+        self,
+        idx: int,
+        T_c2w: np.ndarray,
+        *,
+        stride: int,
+        max_gaussians: int,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Lift DPT depth of frame ``idx`` into world-frame Gaussian attrs."""
+        cfg = self.cfg
+        device = self.device
+        rgb_t, K_np, _ = self._ensure_frame_tensors(idx)
+        h, w = self._hw  # type: ignore
+        rgb = rgb_t.detach().cpu().numpy().transpose(1, 2, 0)
