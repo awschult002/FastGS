@@ -81,6 +81,20 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY = 
         
         metric_map = (l1_loss_norm > args.loss_thresh).int()
 
+        if getattr(args, "canny_densify", False):
+            from utils.canny_utils import edge_mask_bool
+            # Per-pixel L1 (channel mean) before min-max norm — absolute thresh ~0.05
+            l1_abs = torch.mean(torch.abs(render_image - gt_image), 0).detach()
+            edge = edge_mask_bool(
+                gt_image,
+                low=float(getattr(args, "canny_low", 50.0)),
+                high=float(getattr(args, "canny_high", 150.0)),
+                dilate=int(getattr(args, "canny_dilate", 1)),
+            )
+            edge_t = torch.from_numpy(edge).to(device=l1_abs.device)
+            thresh = float(getattr(args, "canny_edge_loss_thresh", 0.05))
+            metric_map = (metric_map.bool() | (edge_t & (l1_abs > thresh))).int()
+
         render_pkg = render_fastgs(my_viewpoint_cam, gaussians, pipe, bg, args.mult, get_flag = get_flag, metric_map = metric_map)
 
         accum_loss_counts = render_pkg["accum_metric_counts"]
