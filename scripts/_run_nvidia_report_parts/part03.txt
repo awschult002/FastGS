@@ -1,0 +1,89 @@
+                )
+            except Exception as e:  # noqa: BLE001
+                report["phases"]["ate_eval"] = {
+                    "ok": False,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+                report["errors"].append({"phase": "ate_eval", "error": str(e)})
+        else:
+            report["phases"]["ate_eval"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "no poses from hybrid_seed",
+            }
+
+        # --- phase: jump_stress ---
+        if args.skip_jump_stress:
+            report["phases"]["jump_stress"] = {
+                "ok": True,
+                "skipped": True,
+                "reason": "--skip_jump_stress",
+                "seconds": 0.0,
+            }
+        else:
+            try:
+                report["phases"]["jump_stress"] = phase_jump_stress(args, device, out_dir)
+            except Exception as e:  # noqa: BLE001
+                report["phases"]["jump_stress"] = {
+                    "ok": False,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+                report["errors"].append({"phase": "jump_stress", "error": str(e)})
+
+        # --- phase: fastgs_train ---
+        try:
+            report["phases"]["fastgs_train"] = phase_fastgs_train(
+                args, env, colmap_dir, out_dir
+            )
+        except Exception as e:  # noqa: BLE001
+            report["phases"]["fastgs_train"] = {
+                "ok": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+            report["errors"].append({"phase": "fastgs_train", "error": str(e)})
+
+        # --- write reports ---
+        report["notes_for_agent"] = build_notes(report, scene_name)
+        report["artifacts"] = {
+            "out_dir": out_dir,
+            "colmap": colmap_dir,
+            "report_json": os.path.join(out_dir, "report.json"),
+            "report_md": os.path.join(out_dir, "REPORT.md"),
+            "logs": log_path,
+            "seed_stats": os.path.join(out_dir, "seed_stats.json"),
+            "ate": os.path.join(out_dir, "ate.json"),
+            "jump_stress": os.path.join(out_dir, "jump_stress.json"),
+            "fastgs_model": os.path.join(out_dir, "fastgs_model"),
+        }
+        report["timestamp_utc_finished"] = _now_utc().isoformat()
+
+        # Strip non-serializable leftovers
+        for ph in report["phases"].values():
+            if isinstance(ph, dict):
+                ph.pop("poses", None)
+                ph.pop("gt", None)
+                ph.pop("ds", None)
+
+        report_json = os.path.join(out_dir, "report.json")
+        report_md = os.path.join(out_dir, "REPORT.md")
+        _write_json(report_json, report)
+        write_report_md(report, report_md)
+
+        print()
+        print("=" * 60)
+        print(f"REPORT JSON: {report_json}")
+        print(f"REPORT MD:   {report_md}")
+        print(f"notes_for_agent: {report['notes_for_agent'][:200]}...")
+        print("=" * 60)
+
+    # Exit non-zero if hybrid_seed failed (core phase)
+    if not (report["phases"].get("hybrid_seed") or {}).get("ok"):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
