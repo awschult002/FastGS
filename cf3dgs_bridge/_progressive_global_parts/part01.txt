@@ -1,0 +1,234 @@
+        dpath = self.depth_paths[idx]
+        if dpath is None:
+            raise RuntimeError(f"missing depth for frame {idx}")
+        depth = load_depth_npz(dpath, key=cfg.depth_key)
+        depth = resize_depth(depth, w, h)
+        means_c, colors, log_scales, opacity_logit, quats = depth_to_local_gaussians(
+            depth,
+            rgb,
+            K_np,
+            stride=stride,
+            min_depth=cfg.min_depth,
+            max_depth=cfg.max_depth,
+            max_gaussians=max_gaussians,
+            opacity_init=cfg.opacity_init,
+            scale_mult=cfg.scale_mult,
+            device=device,
+        )
+        T = torch.tensor(T_c2w, device=device, dtype=torch.float32)
+        means_w = transform_points(T, means_c)
+        # Identity quats remain valid under rigid transform for isotropic splat.
+        return means_w, colors, log_scales, opacity_logit, quats
+
+    def _init_global_from_frame0(self) -> None:
+        cfg = self.cfg
+        means, colors, log_scales, opacity_logit, quats = self._lift_frame_world(
+            0,
+            eye4(),
+            stride=cfg.downsample,
+            max_gaussians=min(cfg.max_global_gaussians, cfg.max_local_gaussians * 2),
+        )
+        self.G_global = _LocalGaussParams(means, colors, log_scales, opacity_logit, quats)
+        target0 = self._rgb_cache[0]
+        assert self._K_t is not None and self._hw is not None
+        h, w = self._hw
+        K_t = self._K_t
+        I = torch.eye(4, device=self.device, dtype=torch.float32)
+        opt = torch.optim.Adam(
+            [
+                {"params": [self.G_global.means], "lr": cfg.lr_gauss_global * 0.1},
+                {"params": [self.G_global.colors], "lr": cfg.lr_gauss_global},
+                {"params": [self.G_global.log_scales], "lr": cfg.lr_gauss_global * 0.5},
+                {"params": [self.G_global.opacity_logit], "lr": cfg.lr_gauss_global},
+                {"params": [self.G_global.quats], "lr": cfg.lr_gauss_global * 0.1},
+            ]
+        )
+        for it in range(cfg.init_fit_iters):
+            opt.zero_grad()
+            m, c, o, s, q = self.G_global.packed()
+            render = try_fastgs_rasterizer(
+                m, c, o, s, q, K_t, I, h, w,
+                bg_color=cfg.bg_color,
+                isotropic=cfg.isotropic,
+                mode=cfg.splat_mode,
+            )
+            loss = photometric_loss(render, target0, lambda_dssim=cfg.lambda_dssim)
+            loss.backward()
+            opt.step()
+            if cfg.log_every and (it % cfg.log_every == 0 or it == cfg.init_fit_iters - 1):
+                print(
+                    f"  [global init] iter {it:03d}/{cfg.init_fit_iters} "
+                    f"loss={float(loss.detach()):.4f} N={m.shape[0]}"
+                )
+
+    def _densify_from_frame(self, idx: int, T_c2w: np.ndarray) -> None:
+        cfg = self.cfg
+        means, colors, log_scales, opacity_logit, quats = self._lift_frame_world(
+            idx,
+            T_c2w,
+            stride=cfg.densify_stride,
+            max_gaussians=cfg.densify_max_new,
+        )
+        before = 0 if self.G_global is None else int(self.G_global.means.shape[0])
+        self.G_global = _append_gaussians(
+            self.G_global,
+            means,
+            colors,
+            log_scales,
+            opacity_logit,
+            quats,
+            cfg.max_global_gaussians,
+            cfg.prune_opacity_floor,
+        )
+        after = int(self.G_global.means.shape[0])
+        print(f"  [densify] frame {idx}: G_global {before} → {after}")
+
+    def _joint_optimize(self, upto_idx: int) -> None:
+        """Jointly optimize G_global + last pose_window c2w poses using views ≤ upto_idx."""
+        cfg = self.cfg
+        assert self.G_global is not None
+        assert self._K_t is not None and self._hw is not None
+        h, w = self._hw
+        K_t = self._K_t
+        device = self.device
+
+        # Optimizable pose indices: last pose_window frames in [1, upto_idx] (frame 0 fixed)
+        start = max(1, upto_idx - cfg.pose_window + 1)
+        opt_ids = list(range(start, upto_idx + 1))
+        # Support views for loss: opt_ids + a few older frozen frames
+        support = set(opt_ids)
+        support.add(0)
+        older = [j for j in range(0, start) if j != 0]
+        for j in reversed(older):
+            if len(support) >= len(opt_ids) + max(1, cfg.frozen_view_support):
+                break
+            support.add(j)
+        support.add(upto_idx)
+        view_ids = sorted(support)
+
+        for j in view_ids:
+            self._ensure_frame_tensors(j)
+
+        pose_params: Dict[int, _PoseParams] = {}
+        pose_init: Dict[int, torch.Tensor] = {}
+        for j in opt_ids:
+            T0 = self.poses.T_world_cam[j]
+            pose_params[j] = _PoseParams(T0, device)
+            pose_init[j] = torch.tensor(T0, device=device, dtype=torch.float32)
+
+        frozen_c2w = {
+            j: torch.tensor(self.poses.T_world_cam[j], device=device, dtype=torch.float32)
+            for j in view_ids
+            if j not in pose_params
+        }
+
+        gauss_params = [
+            {"params": [self.G_global.means], "lr": cfg.lr_gauss_global * 0.1},
+            {"params": [self.G_global.colors], "lr": cfg.lr_gauss_global},
+            {"params": [self.G_global.log_scales], "lr": cfg.lr_gauss_global * 0.5},
+            {"params": [self.G_global.opacity_logit], "lr": cfg.lr_gauss_global},
+            {"params": [self.G_global.quats], "lr": cfg.lr_gauss_global * 0.05},
+        ]
+        pose_param_groups = [
+            {"params": [pp.quat], "lr": cfg.lr_pose_global} for pp in pose_params.values()
+        ] + [
+            {"params": [pp.trans], "lr": cfg.lr_pose_global} for pp in pose_params.values()
+        ]
+        opt_g = torch.optim.Adam(gauss_params)
+        opt_p = torch.optim.Adam(pose_param_groups) if pose_param_groups else None
+
+        best_loss = float("inf")
+        best_poses = {j: self.poses.T_world_cam[j].copy() for j in opt_ids}
+
+        def _snapshot_gauss():
+            return (
+                self.G_global.means.detach().clone(),
+                self.G_global.colors.detach().clone(),
+                self.G_global.log_scales.detach().clone(),
+                self.G_global.opacity_logit.detach().clone(),
+                self.G_global.quats.detach().clone(),
+            )
+
+        def _restore_gauss(state):
+            with torch.no_grad():
+                self.G_global.means.copy_(state[0])
+                self.G_global.colors.copy_(state[1])
+                self.G_global.log_scales.copy_(state[2])
+                self.G_global.opacity_logit.copy_(state[3])
+                self.G_global.quats.copy_(state[4])
+
+        best_gauss_state = _snapshot_gauss()
+        gauss_only_until = int(cfg.global_iters * float(cfg.gauss_only_iters_frac))
+
+        def _pose_prior() -> torch.Tensor:
+            if not pose_params:
+                return torch.zeros((), device=device)
+            acc = torch.zeros((), device=device)
+            for j, pp in pose_params.items():
+                T = pp.matrix()
+                T0 = pose_init[j]
+                dt = T[:3, 3] - T0[:3, 3]
+                acc = acc + cfg.pose_prior_trans * (dt * dt).sum()
+                # Frobenius proxy for small rotation delta
+                dR = T[:3, :3] - T0[:3, :3]
+                acc = acc + cfg.pose_prior_rot * (dR * dR).sum()
+            return acc / float(len(pose_params))
+
+        def _reset_pose(j: int) -> None:
+            T0n = _orthonormalize_se3(pose_init[j].detach().cpu().numpy())
+            fresh = _PoseParams(T0n, device)
+            pose_params[j].quat.copy_(fresh.quat.detach())
+            pose_params[j].trans.copy_(fresh.trans.detach())
+
+        def _clamp_poses() -> None:
+            with torch.no_grad():
+                for j, pp in pose_params.items():
+                    if not torch.isfinite(pp.quat).all() or not torch.isfinite(pp.trans).all():
+                        _reset_pose(j)
+                        continue
+                    pp.quat.copy_(quat_normalize(pp.quat))
+                    T0 = pose_init[j]
+                    dt = pp.trans - T0[:3, 3]
+                    n = float(dt.norm().item())
+                    if not np.isfinite(n):
+                        _reset_pose(j)
+                        continue
+                    if n > cfg.pose_max_trans_delta and n > 1e-8:
+                        pp.trans.copy_(T0[:3, 3] + dt * (cfg.pose_max_trans_delta / n))
+                    T_cur = pp.matrix()
+                    if not torch.isfinite(T_cur).all():
+                        _reset_pose(j)
+                        continue
+                    R_rel = T_cur[:3, :3] @ T0[:3, :3].T
+                    cos_th = float(
+                        torch.clamp(0.5 * (torch.trace(R_rel) - 1.0), -1.0, 1.0).item()
+                    )
+                    ang = float(np.arccos(cos_th))
+                    if ang > cfg.pose_max_rot_delta:
+                        t_keep = pp.trans.detach().clone()
+                        _reset_pose(j)
+                        pose_params[j].trans.copy_(t_keep)
+
+        for it in range(cfg.global_iters):
+            opt_g.zero_grad()
+            if opt_p is not None:
+                opt_p.zero_grad()
+            m, c, o, s, q = self.G_global.packed()
+            loss_acc = None
+            for j in view_ids:
+                if j in pose_params:
+                    T_c2w = pose_params[j].matrix()
+                else:
+                    T_c2w = frozen_c2w[j]
+                T_w2c = torch.linalg.inv(T_c2w)
+                render = try_fastgs_rasterizer(
+                    m, c, o, s, q, K_t, T_w2c, h, w,
+                    bg_color=cfg.bg_color,
+                    isotropic=cfg.isotropic,
+                    mode=cfg.splat_mode,
+                )
+                lj = photometric_loss(
+                    render, self._rgb_cache[j], lambda_dssim=cfg.lambda_dssim
+                )
+                loss_acc = lj if loss_acc is None else loss_acc + lj
+            assert loss_acc is not None
