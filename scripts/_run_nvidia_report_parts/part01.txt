@@ -1,0 +1,314 @@
+        long_range_stride=args.long_range_stride,
+        resize_width=args.resize_width if args.resize_width > 0 else None,
+        max_keypoints=args.max_keypoints,
+        feature_backend=args.feature_backend,
+        device=device,
+        pose_graph=not args.no_pose_graph,
+        depth_pnp_weight=args.depth_pnp_weight,
+        lightglue_weight=args.lightglue_weight,
+        scale_align=not args.no_scale_align,
+    )
+    seeder = HybridPoseSeeder(ds, depth_paths, cfg)
+    poses = seeder.solve()
+
+    # Count long-range-ish jumps (gap > sequential_radius)
+    n_lg = len(seeder.jump_edges)
+    n_long = sum(
+        1
+        for e in seeder.jump_edges
+        if (e.j - e.i) >= max(args.long_range_stride, args.sequential_radius + 1)
+    )
+
+    stats = {
+        "scene": os.path.basename(os.path.normpath(args.scene)),
+        "num_frames_full": n_full,
+        "num_frames": len(ds),
+        "backend": seeder.backend_name,
+        "used_lightglue": bool(seeder.used_lightglue),
+        "scale_ratio": float(seeder.scale_ratio),
+        "n_seq_edges": len(seeder.sequential_edges),
+        "n_lg_edges": n_lg,
+        "n_long_range": n_long,
+        "feature_backend": args.feature_backend,
+        "device": device,
+        "pose_graph": bool(cfg.pose_graph),
+        "has_gt": gt is not None,
+    }
+    phase["stats"] = stats
+    _write_json(os.path.join(out_dir, "seed_stats.json"), stats)
+
+    export_solved_scene_to_colmap(
+        ds,
+        poses,
+        colmap_dir,
+        force_copy_images=bool(args.copy_images),
+        write_train_readme=True,
+        model_path_hint=model_hint,
+    )
+    phase["colmap_export"] = colmap_dir
+    phase["poses"] = poses
+    phase["gt"] = gt
+    phase["ds"] = ds
+    phase["ok"] = True
+    phase["seconds"] = time.perf_counter() - t0
+    print(f"[hybrid_seed] ok in {phase['seconds']:.2f}s → {colmap_dir}")
+    print(json.dumps(stats, indent=2))
+    return phase
+
+
+def phase_ate_eval(poses, gt, scene_name: str, out_dir: str, rpe_delta: int = 1) -> Dict[str, Any]:
+    from cf3dgs_bridge.opencv_solver import absolute_trajectory_error, relative_pose_error
+
+    t0 = time.perf_counter()
+    phase: Dict[str, Any] = {"ok": False, "seconds": 0.0, "metrics": {}}
+    if gt is None:
+        phase["skipped"] = True
+        phase["reason"] = "no poses_bounds / GT poses"
+        phase["ok"] = True
+        phase["seconds"] = time.perf_counter() - t0
+        print("[ate_eval] skipped — no GT")
+        return phase
+
+    metrics = absolute_trajectory_error(poses.T_world_cam, gt)
+    rpe = relative_pose_error(poses.T_world_cam, gt, delta=rpe_delta)
+    metrics.update(rpe)
+    metrics["paper_cf3dgs_ate"] = PAPER_ATE.get(scene_name)
+    metrics["scene"] = scene_name
+    phase["metrics"] = metrics
+    phase["ok"] = True
+    phase["seconds"] = time.perf_counter() - t0
+    _write_json(os.path.join(out_dir, "ate.json"), metrics)
+    print(f"[ate_eval] ATE RMSE={metrics['ate_rmse']:.6f} in {phase['seconds']:.2f}s")
+    return phase
+
+
+
+def _subsample_indices(n: int, stride: int, max_keep: int = 0):
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    idx = list(range(0, n, stride))
+    if max_keep and max_keep < len(idx):
+        idx = idx[:max_keep]
+    return idx
+
+
+def _apply_subsample(ds, depth_paths, gt, indices):
+    ds.image_paths = [ds.image_paths[i] for i in indices]
+    depth_paths = [depth_paths[i] for i in indices]
+    gt_sub = None
+    if gt is not None:
+        gt_sub = [gt[i] for i in indices]
+    return ds, depth_paths, gt_sub
+
+
+def phase_jump_stress(args, device: str, out_dir: str) -> Dict[str, Any]:
+    """Subsample stride 5, max_keep 24; depth_pnp vs hybrid ATE."""
+    from cf3dgs_bridge.depth_pnp_solver import DepthPnPProgressiveSolver, DepthPnPSolveConfig
+    from cf3dgs_bridge.hybrid_seeder import HybridPoseSeeder, HybridSeedConfig
+    from cf3dgs_bridge.opencv_solver import absolute_trajectory_error
+    from cf3dgs_bridge.tanks_loader import load_tanks_scene
+
+    t0 = time.perf_counter()
+    phase: Dict[str, Any] = {
+        "ok": False,
+        "seconds": 0.0,
+        "skipped": False,
+        "stride": 5,
+        "max_keep": 24,
+    }
+
+    ds, gt, depth_paths = load_tanks_scene(args.scene)
+    if gt is None:
+        phase["skipped"] = True
+        phase["reason"] = "no GT for jump stress ATE"
+        phase["ok"] = True
+        phase["seconds"] = time.perf_counter() - t0
+        return phase
+    if not any(depth_paths):
+        phase["skipped"] = True
+        phase["reason"] = "no dpt/"
+        phase["ok"] = True
+        phase["seconds"] = time.perf_counter() - t0
+        return phase
+
+    # Cap source frames if max_frames set (consistent with main seed)
+    if args.max_frames and args.max_frames < len(ds):
+        ds.image_paths = ds.image_paths[: args.max_frames]
+        depth_paths = depth_paths[: args.max_frames]
+        gt = gt[: args.max_frames]
+
+    n_full = len(ds)
+    indices = _subsample_indices(n_full, stride=5, max_keep=24)
+    if len(indices) < 3:
+        phase["skipped"] = True
+        phase["reason"] = f"need >=3 kept frames, got {len(indices)}"
+        phase["ok"] = True
+        phase["seconds"] = time.perf_counter() - t0
+        return phase
+
+    ds, depth_paths, gt_sub = _apply_subsample(ds, depth_paths, gt, indices)
+    rw = min(args.resize_width, 640) if args.resize_width > 0 else 640
+
+    print(f"[jump_stress] keep={len(indices)} (stride=5) resize={rw}")
+    dcfg = DepthPnPSolveConfig(
+        resize_width=rw,
+        feature_backend="sift",
+        pose_graph=False,
+        photo_refine=False,
+    )
+    dsolver = DepthPnPProgressiveSolver(ds, depth_paths, dcfg)
+    dposes = dsolver.solve()
+    d_metrics = absolute_trajectory_error(dposes.T_world_cam, gt_sub)
+
+    hcfg = HybridSeedConfig(
+        sequential_radius=1,
+        pair_radius=args.pair_radius,
+        long_range_stride=max(4, args.long_range_stride // 2),
+        resize_width=rw if rw > 0 else None,
+        max_keypoints=args.max_keypoints,
+        feature_backend=args.feature_backend if args.feature_backend != "sift" else "superpoint",
+        device=device,
+        pose_graph=True,
+        depth_pnp_weight=args.depth_pnp_weight,
+        lightglue_weight=args.lightglue_weight,
+        scale_align=not args.no_scale_align,
+    )
+    hseeder = HybridPoseSeeder(ds, depth_paths, hcfg)
+    hposes = hseeder.solve()
+    h_metrics = absolute_trajectory_error(hposes.T_world_cam, gt_sub)
+
+    import numpy as np
+
+    winner = "hybrid" if h_metrics["ate_rmse"] <= d_metrics["ate_rmse"] else "depth_pnp"
+    hybrid_ok = (
+        np.isfinite(h_metrics["ate_rmse"])
+        and h_metrics["ate_rmse"] < max(1.0, 2.0 * d_metrics["ate_rmse"] + 0.05)
+    )
+
+    phase.update(
+        {
+            "ok": True,
+            "num_full": n_full,
+            "num_kept": len(indices),
+            "indices_head": indices[:8],
+            "depth_pnp_ate": float(d_metrics["ate_rmse"]),
+            "depth_pnp_ate_mean": float(d_metrics["ate_mean"]),
+            "hybrid_ate": float(h_metrics["ate_rmse"]),
+            "hybrid_ate_mean": float(h_metrics["ate_mean"]),
+            "winner": winner,
+            "hybrid_ok": bool(hybrid_ok),
+            "ate_delta_hybrid_minus_depth_pnp": float(
+                h_metrics["ate_rmse"] - d_metrics["ate_rmse"]
+            ),
+            "scale_ratio": float(hseeder.scale_ratio),
+            "used_lightglue": bool(hseeder.used_lightglue),
+            "n_lg_edges": len(hseeder.jump_edges),
+            "n_seq_edges": len(hseeder.sequential_edges),
+            "backend": hseeder.backend_name,
+        }
+    )
+    phase["seconds"] = time.perf_counter() - t0
+    _write_json(os.path.join(out_dir, "jump_stress.json"), {k: v for k, v in phase.items()})
+    print(
+        f"[jump_stress] depth_pnp={phase['depth_pnp_ate']:.4f} "
+        f"hybrid={phase['hybrid_ate']:.4f} winner={winner} "
+        f"({phase['seconds']:.1f}s)"
+    )
+    return phase
+
+
+def phase_fastgs_train(
+    args,
+    env: Dict[str, Any],
+    colmap_dir: str,
+    out_dir: str,
+) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    phase: Dict[str, Any] = {
+        "ok": False,
+        "seconds": 0.0,
+        "skipped": False,
+        "train_iters": args.train_iters,
+        "note_full_iters": 30000,
+    }
+    model_dir = os.path.join(out_dir, "fastgs_model")
+    phase["model_dir"] = model_dir
+
+    if args.skip_train:
+        phase["skipped"] = True
+        phase["reason"] = "--skip_train set"
+        phase["ok"] = True
+        phase["seconds"] = time.perf_counter() - t0
+        return phase
+
+    if not env.get("cuda_available"):
+        phase["skipped"] = True
+        phase["reason"] = "CUDA not available (FastGS rasterizer needs GPU)"
+        phase["ok"] = True
+        phase["seconds"] = time.perf_counter() - t0
+        print(f"[fastgs_train] skipped: {phase['reason']}")
+        return phase
+
+    # train.py accepts --iterations via OptimizationParams
+    cmd = [
+        sys.executable,
+        os.path.join(ROOT, "train.py"),
+        "-s",
+        colmap_dir,
+        "-m",
+        model_dir,
+        "--iterations",
+        str(args.train_iters),
+        "--save_iterations",
+        str(args.train_iters),
+        "--test_iterations",
+        str(args.train_iters),
+        "--quiet",
+    ]
+    phase["cmd"] = cmd
+    print(f"[fastgs_train] launching: {' '.join(cmd)}")
+    train_log = os.path.join(out_dir, "train.log")
+    try:
+        with open(train_log, "w", encoding="utf-8") as tf:
+            proc = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                stdout=tf,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=args.train_timeout,
+            )
+        phase["exit_code"] = proc.returncode
+        phase["ok"] = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        phase["exit_code"] = -1
+        phase["ok"] = False
+        phase["error"] = f"timeout after {args.train_timeout}s"
+    except Exception as e:  # noqa: BLE001
+        phase["exit_code"] = -1
+        phase["ok"] = False
+        phase["error"] = str(e)
+
+    # Tail of train log
+    last_lines: List[str] = []
+    if os.path.isfile(train_log):
+        with open(train_log, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        last_lines = [ln.rstrip() for ln in lines[-40:]]
+    phase["last_log_lines"] = last_lines
+
+    # point_cloud written?
+    pc_found = False
+    pc_paths: List[str] = []
+    if os.path.isdir(model_dir):
+        for root, _dirs, files in os.walk(model_dir):
+            for fn in files:
+                if fn.endswith(".ply") and "point_cloud" in root.replace("\\", "/"):
+                    pc_found = True
+                    pc_paths.append(os.path.join(root, fn))
+                elif fn == "point_cloud.ply":
+                    pc_found = True
+                    pc_paths.append(os.path.join(root, fn))
+    phase["point_cloud_written"] = pc_found
+    phase["point_cloud_paths"] = pc_paths[:5]
+    phase["seconds"] = time.perf_counter() - t0

@@ -1,0 +1,283 @@
+    print(
+        f"[fastgs_train] exit={phase.get('exit_code')} "
+        f"point_cloud={pc_found} ({phase['seconds']:.1f}s)"
+    )
+    return phase
+
+
+def write_report_md(report: Dict[str, Any], path: str) -> None:
+    scene = report.get("config", {}).get("scene_name", "?")
+    phases = report.get("phases", {})
+    ate_m = (phases.get("ate_eval") or {}).get("metrics") or {}
+    seed = (phases.get("hybrid_seed") or {}).get("stats") or {}
+    jump = phases.get("jump_stress") or {}
+    train = phases.get("fastgs_train") or {}
+    env = report.get("env") or {}
+
+    def _fmt(v: Any, nd: int = 4) -> str:
+        if v is None:
+            return "—"
+        if isinstance(v, float):
+            return f"{v:.{nd}f}"
+        return str(v)
+
+    lines = [
+        f"# NVIDIA hybrid → FastGS report — {scene}",
+        "",
+        f"- **run_id**: `{report.get('run_id')}`",
+        f"- **timestamp_utc**: {report.get('timestamp_utc')}",
+        f"- **git**: `{report.get('git', {}).get('branch')}` @ "
+        f"`{(report.get('git') or {}).get('commit', '')[:12]}`"
+        f"{' (dirty)' if (report.get('git') or {}).get('dirty') else ''}",
+        f"- **host**: {env.get('hostname')} | torch {env.get('torch_version')} | "
+        f"CUDA={env.get('cuda_available')} | GPU={env.get('gpu_name') or 'n/a'}",
+        "",
+        "## Phase summary",
+        "",
+        "| Phase | OK | Seconds | Key metric |",
+        "| --- | --- | --- | --- |",
+    ]
+    for name in ("hybrid_seed", "ate_eval", "jump_stress", "fastgs_train"):
+        ph = phases.get(name) or {}
+        key = ""
+        if name == "hybrid_seed":
+            key = f"backend={seed.get('backend')}, LG={seed.get('used_lightglue')}"
+        elif name == "ate_eval":
+            key = f"ATE={_fmt(ate_m.get('ate_rmse'))}"
+        elif name == "jump_stress":
+            if ph.get("skipped"):
+                key = f"skipped: {ph.get('reason', '')}"
+            else:
+                key = (
+                    f"depth_pnp={_fmt(ph.get('depth_pnp_ate'))} "
+                    f"hybrid={_fmt(ph.get('hybrid_ate'))}"
+                )
+        elif name == "fastgs_train":
+            if ph.get("skipped"):
+                key = f"skipped: {ph.get('reason', '')}"
+            else:
+                key = f"exit={ph.get('exit_code')} pc={ph.get('point_cloud_written')}"
+        lines.append(
+            f"| {name} | {ph.get('ok')} | {_fmt(ph.get('seconds'), 2)} | {key} |"
+        )
+
+    lines += [
+        "",
+        "## Seed stats",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| frames | {seed.get('num_frames')} / {seed.get('num_frames_full')} |",
+        f"| n_seq_edges | {seed.get('n_seq_edges')} |",
+        f"| n_lg_edges | {seed.get('n_lg_edges')} |",
+        f"| n_long_range | {seed.get('n_long_range')} |",
+        f"| scale_ratio | {_fmt(seed.get('scale_ratio'))} |",
+        f"| backend | {seed.get('backend')} |",
+        "",
+        "## ATE / RPE",
+        "",
+        "| Metric | Value |",
+        "| --- | --- |",
+        f"| ate_rmse | {_fmt(ate_m.get('ate_rmse'))} |",
+        f"| ate_mean | {_fmt(ate_m.get('ate_mean'))} |",
+        f"| rpe_t_rmse | {_fmt(ate_m.get('rpe_t_rmse'))} |",
+        f"| rpe_r_rmse_deg | {_fmt(ate_m.get('rpe_r_rmse_deg'))} |",
+        f"| paper_cf3dgs_ate | {_fmt(ate_m.get('paper_cf3dgs_ate'))} |",
+        f"| umeyama_scale | {_fmt(ate_m.get('scale'))} |",
+        "",
+        "## Jump stress",
+        "",
+    ]
+    if jump.get("skipped"):
+        lines.append(f"_Skipped_: {jump.get('reason', '—')}")
+    else:
+        lines += [
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| depth_pnp_ate | {_fmt(jump.get('depth_pnp_ate'))} |",
+            f"| hybrid_ate | {_fmt(jump.get('hybrid_ate'))} |",
+            f"| winner | {jump.get('winner')} |",
+            f"| hybrid_ok | {jump.get('hybrid_ok')} |",
+            f"| scale_ratio | {_fmt(jump.get('scale_ratio'))} |",
+        ]
+
+    lines += [
+        "",
+        "## FastGS train",
+        "",
+        f"- skipped: **{train.get('skipped')}** — {train.get('reason', '')}",
+        f"- train_iters (this run): `{train.get('train_iters')}` "
+        f"(full quality: `{train.get('note_full_iters', 30000)}`)",
+        f"- point_cloud_written: {train.get('point_cloud_written')}",
+        "",
+        "## Notes for agent",
+        "",
+        report.get("notes_for_agent") or "—",
+        "",
+        "## How to send this back to Chief of Staff",
+        "",
+        "1. Copy **`report.json`** from this `out_dir` (minimum).",
+        "2. Optionally zip the whole folder for logs + COLMAP export:",
+        "",
+        "```bash",
+        f"zip -r nvidia_report_{scene}.zip {os.path.basename(os.path.dirname(path)) or 'OUT_DIR'}",
+        "# or from parent of out_dir:",
+        "zip -r nvidia_report.zip \"$(basename \"$OUT_DIR\")\"",
+        "```",
+        "",
+        "3. Paste `report.json` into chat or attach the zip so the agent can tune",
+        "   `--pair_radius`, `--long_range_stride`, `--lightglue_weight`, frame count, etc.",
+        "",
+        f"- Artifacts: see `report.json` → `artifacts`",
+        f"- Full tee log: `run.log`",
+        "",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="NVIDIA hybrid-seed benchmark + machine-readable report"
+    )
+    p.add_argument("--scene", required=True, help="Tanks scene root (images/ + dpt/ + poses_bounds)")
+    p.add_argument(
+        "--out_dir",
+        type=str,
+        default="",
+        help="Output directory (default: eval_out/nvidia_report_<scene>_<timestamp>)",
+    )
+    p.add_argument("--max_frames", type=int, default=40, help="0 = all frames")
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    p.add_argument("--skip_train", action="store_true", help="Seed+eval only (no train.py)")
+    p.add_argument("--skip_jump_stress", action="store_true")
+    p.add_argument(
+        "--train_iters",
+        type=int,
+        default=7000,
+        help="FastGS smoke iterations (full quality: 30000)",
+    )
+    p.add_argument(
+        "--train_timeout",
+        type=int,
+        default=7200,
+        help="Seconds before killing train.py",
+    )
+    p.add_argument("--sequential_radius", type=int, default=1)
+    p.add_argument("--pair_radius", type=int, default=2)
+    p.add_argument("--long_range_stride", type=int, default=10)
+    p.add_argument("--feature_backend", type=str, default="superpoint",
+                   choices=["superpoint", "aliked", "auto", "sift"])
+    p.add_argument("--resize_width", type=int, default=960)
+    p.add_argument("--max_keypoints", type=int, default=2048)
+    p.add_argument("--depth_pnp_weight", type=float, default=100.0)
+    p.add_argument("--lightglue_weight", type=float, default=0.05)
+    p.add_argument("--no_pose_graph", action="store_true")
+    p.add_argument("--no_scale_align", action="store_true")
+    p.add_argument("--copy_images", action="store_true",
+                   help="Copy images into COLMAP export instead of symlinking")
+    p.add_argument("--rpe_delta", type=int, default=1)
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    scene_name = os.path.basename(os.path.normpath(args.scene))
+    ts = _now_utc().strftime("%Y%m%d_%H%M%S")
+    if not args.out_dir:
+        args.out_dir = os.path.join(
+            ROOT, "eval_out", f"nvidia_report_{scene_name}_{ts}"
+        )
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    run_id = f"{scene_name}_{ts}_{uuid.uuid4().hex[:8]}"
+    log_path = os.path.join(out_dir, "run.log")
+
+    report: Dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "timestamp_utc": _now_utc().isoformat(),
+        "git": _git_info(ROOT),
+        "env": {},
+        "config": {},
+        "phases": {},
+        "artifacts": {},
+        "errors": [],
+        "warnings": [],
+        "notes_for_agent": "",
+    }
+
+    with tee_stdio(log_path):
+        print(f"[nvidia_report] run_id={run_id}")
+        print(f"[nvidia_report] out_dir={out_dir}")
+        print(f"[nvidia_report] scene={args.scene}")
+
+        # --- phase: env ---
+        t0 = time.perf_counter()
+        env = capture_env(args.device)
+        device = env["resolved_device"]
+        report["env"] = env
+        report["config"] = {
+            "scene": os.path.abspath(args.scene),
+            "scene_name": scene_name,
+            "out_dir": out_dir,
+            "max_frames": args.max_frames,
+            "device": args.device,
+            "resolved_device": device,
+            "skip_train": bool(args.skip_train),
+            "skip_jump_stress": bool(args.skip_jump_stress),
+            "train_iters": args.train_iters,
+            "train_iters_full_doc": 30000,
+            "sequential_radius": args.sequential_radius,
+            "pair_radius": args.pair_radius,
+            "long_range_stride": args.long_range_stride,
+            "feature_backend": args.feature_backend,
+            "resize_width": args.resize_width,
+            "max_keypoints": args.max_keypoints,
+            "depth_pnp_weight": args.depth_pnp_weight,
+            "lightglue_weight": args.lightglue_weight,
+            "pose_graph": not args.no_pose_graph,
+            "scale_align": not args.no_scale_align,
+            "copy_images": bool(args.copy_images),
+        }
+        report["phases"]["env"] = {
+            "ok": True,
+            "seconds": time.perf_counter() - t0,
+        }
+        print(json.dumps({"env_summary": {
+            "hostname": env.get("hostname"),
+            "torch": env.get("torch_version"),
+            "cuda": env.get("cuda_available"),
+            "gpu": env.get("gpu_name"),
+            "lightglue": env.get("lightglue_importable"),
+            "device": device,
+        }}, indent=2))
+
+        poses = None
+        gt = None
+        colmap_dir = os.path.join(out_dir, "colmap_export")
+
+        # --- phase: hybrid_seed ---
+        try:
+            seed_phase = phase_hybrid_seed(args, out_dir, device)
+            poses = seed_phase.pop("poses", None)
+            gt = seed_phase.pop("gt", None)
+            seed_phase.pop("ds", None)
+            report["phases"]["hybrid_seed"] = seed_phase
+            colmap_dir = seed_phase.get("colmap_export", colmap_dir)
+        except Exception as e:  # noqa: BLE001
+            report["phases"]["hybrid_seed"] = {
+                "ok": False,
+                "seconds": 0.0,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+            report["errors"].append({"phase": "hybrid_seed", "error": str(e)})
+            print(f"[hybrid_seed] FAILED: {e}")
+
+        # --- phase: ate_eval ---
+        if poses is not None:
+            try:
+                report["phases"]["ate_eval"] = phase_ate_eval(
+                    poses, gt, scene_name, out_dir, rpe_delta=args.rpe_delta
