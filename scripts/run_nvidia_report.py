@@ -1,6 +1,362 @@
 #!/usr/bin/env python3
 """NVIDIA-box benchmark + machine-readable report for hybrid seed → FastGS.
 
-PLACEHOLDER_PARTIAL — being restored; see local FastGS tree.
+Runs timed phases (env → hybrid seed → ATE → jump stress → optional FastGS
+train) and writes ``report.json`` + ``REPORT.md`` that Chief of Staff can parse
+to tune knobs.
+
+Example (Alex on GPU box)::
+
+    bash scripts/run_on_nvidia.sh /path/to/Tanks/Francis --max_frames 40 --device cuda
+
+Smoke (CPU box)::
+
+    .venv/bin/python scripts/run_nvidia_report.py \\
+      --scene /workspace/repos/data/Tanks/Francis \\
+      --max_frames 8 --skip_train --skip_jump_stress --device cpu
 """
-raise SystemExit('run_nvidia_report.py restore incomplete — use local /workspace/repos/FastGS/scripts/run_nvidia_report.py')
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+import traceback
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, TextIO
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT)
+
+# Paper ATE reference (CF-3DGS Table 2) for Francis-class scenes.
+PAPER_ATE = {
+    "Church": 0.002,
+    "Barn": 0.003,
+    "Museum": 0.005,
+    "Family": 0.002,
+    "Horse": 0.003,
+    "Ballroom": 0.002,
+    "Francis": 0.006,
+    "Ignatius": 0.002,
+}
+
+
+class Tee:
+    """Write to multiple streams (stdout + run.log)."""
+
+    def __init__(self, *streams: TextIO) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self.streams:
+            s.flush()
+
+
+@contextmanager
+def tee_stdio(log_path: str):
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)) or ".", exist_ok=True)
+    log_f = open(log_path, "w", encoding="utf-8")
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = Tee(old_out, log_f)  # type: ignore[assignment]
+    sys.stderr = Tee(old_err, log_f)  # type: ignore[assignment]
+    try:
+        yield log_f
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+        log_f.close()
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _git_info(repo: str) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"commit": None, "branch": None, "dirty": None, "error": None}
+    try:
+        def _run(args: List[str]) -> str:
+            return subprocess.check_output(
+                args, cwd=repo, stderr=subprocess.DEVNULL, text=True
+            ).strip()
+
+        info["commit"] = _run(["git", "rev-parse", "HEAD"])
+        info["branch"] = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        dirty = _run(["git", "status", "--porcelain"])
+        info["dirty"] = bool(dirty)
+    except Exception as e:  # noqa: BLE001
+        info["error"] = str(e)
+    return info
+
+
+def capture_env(device_pref: str) -> Dict[str, Any]:
+    utc = _now_utc()
+    # Local note for America/New_York (Alex); box itself is UTC.
+    try:
+        from zoneinfo import ZoneInfo
+
+        local = utc.astimezone(ZoneInfo("America/New_York"))
+        local_note = local.strftime("%Y-%m-%d %H:%M:%S %Z") + " (America/New_York)"
+    except Exception:  # noqa: BLE001
+        local_note = "local TZ unavailable; box clock is UTC"
+
+    env: Dict[str, Any] = {
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "python_full": sys.version,
+        "cwd": os.getcwd(),
+        "timestamp_utc": utc.isoformat(),
+        "timestamp_local_note": local_note,
+        "torch_version": None,
+        "cuda_available": False,
+        "cuda_version": None,
+        "gpu_name": None,
+        "gpu_memory_gb": None,
+        "cv2_version": None,
+        "lightglue_importable": False,
+        "device_pref": device_pref,
+        "resolved_device": None,
+    }
+
+    try:
+        import torch
+
+        env["torch_version"] = torch.__version__
+        env["cuda_available"] = bool(torch.cuda.is_available())
+        env["cuda_version"] = getattr(torch.version, "cuda", None)
+        if env["cuda_available"]:
+            env["gpu_name"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            env["gpu_memory_gb"] = round(props.total_memory / (1024**3), 2)
+    except Exception as e:  # noqa: BLE001
+        env["torch_error"] = str(e)
+
+    try:
+        import cv2
+
+        env["cv2_version"] = cv2.__version__
+    except Exception as e:  # noqa: BLE001
+        env["cv2_error"] = str(e)
+
+    try:
+        from cf3dgs_bridge.lightglue_seeder import lightglue_available
+
+        env["lightglue_importable"] = bool(lightglue_available())
+    except Exception:
+        try:
+            import lightglue  # noqa: F401
+
+            env["lightglue_importable"] = True
+        except Exception:
+            env["lightglue_importable"] = False
+
+    if device_pref == "auto":
+        env["resolved_device"] = "cuda" if env["cuda_available"] else "cpu"
+    else:
+        env["resolved_device"] = device_pref
+
+    return env
+
+
+def _write_json(path: str, obj: Any) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, default=_json_default)
+        f.write("\n")
+
+
+def _json_default(o: Any) -> Any:
+    try:
+        import numpy as np
+
+        if isinstance(o, (np.floating, np.integer)):
+            return o.item()
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+    except Exception:
+        pass
+    return str(o)
+
+
+def build_notes(
+    report: Dict[str, Any],
+    scene_name: str,
+) -> str:
+    """Automatic heuristics for Chief of Staff / agent tuning."""
+    lines: List[str] = []
+    phases = report.get("phases", {})
+    ate = phases.get("ate_eval", {})
+    jump = phases.get("jump_stress", {})
+    train = phases.get("fastgs_train", {})
+    seed = phases.get("hybrid_seed", {})
+    paper = PAPER_ATE.get(scene_name)
+
+    metrics = ate.get("metrics") or {}
+    ate_rmse = metrics.get("ate_rmse")
+    if ate.get("ok") and ate_rmse is not None:
+        if ate_rmse > 0.05:
+            lines.append(
+                f"Hybrid ATE RMSE={ate_rmse:.4f} > 0.05 — consider more frames "
+                "(--max_frames), check dpt/ coverage, try --resize_width 960, or "
+                "verify LightGlue loaded (used_lightglue)."
+            )
+        elif paper is not None and ate_rmse > 3.0 * paper:
+            lines.append(
+                f"Hybrid ATE={ate_rmse:.4f} is >> CF-3DGS paper {paper:.4f} for "
+                f"{scene_name}; scale/pose-graph weights may need tuning "
+                "(--depth_pnp_weight / --lightglue_weight)."
+            )
+        else:
+            lines.append(
+                f"Hybrid ATE RMSE={ate_rmse:.4f} looks reasonable"
+                + (f" (paper ref {paper})" if paper is not None else "")
+                + "."
+            )
+
+    stats = seed.get("stats") or {}
+    if seed.get("ok"):
+        if not stats.get("used_lightglue", True):
+            lines.append(
+                "LightGlue was NOT used (sequential DepthPnP fallback). "
+                "Install LightGlue and use --device cuda on the NVIDIA box."
+            )
+        sr = stats.get("scale_ratio")
+        if sr is not None and (sr < 0.1 or sr > 50.0):
+            lines.append(
+                f"scale_ratio={sr:.4g} is extreme — check DPT depth / scale_align; "
+                "jump edges may be poorly scaled."
+            )
+        if stats.get("n_lg_edges", 0) == 0 and stats.get("n_long_range", 0) == 0:
+            lines.append(
+                "No LightGlue jump edges — increase --pair_radius / lower "
+                "--long_range_stride, or raise --max_frames."
+            )
+
+    if jump.get("ok") and not jump.get("skipped"):
+        d_ate = jump.get("depth_pnp_ate")
+        h_ate = jump.get("hybrid_ate")
+        if d_ate is not None and h_ate is not None:
+            delta = h_ate - d_ate
+            if abs(delta) < 0.005 and h_ate > 0.02:
+                lines.append(
+                    f"Jump stress: hybrid ATE ({h_ate:.4f}) barely beats depth_pnp "
+                    f"({d_ate:.4f}); check scale_ratio={jump.get('scale_ratio')} "
+                    "and long_range_stride / lightglue_weight."
+                )
+            elif h_ate < d_ate:
+                lines.append(
+                    f"Jump stress: hybrid improves ATE ({h_ate:.4f} < {d_ate:.4f}) — good."
+                )
+            else:
+                lines.append(
+                    f"Jump stress: hybrid worse than depth_pnp ({h_ate:.4f} > {d_ate:.4f}); "
+                    "consider lowering --lightglue_weight or raising min jump gap."
+                )
+            if not jump.get("hybrid_ok", True):
+                lines.append(
+                    "Jump stress flagged hybrid_ok=false (collapse / large regression)."
+                )
+
+    if train.get("skipped"):
+        lines.append(
+            f"FastGS train skipped: {train.get('reason', 'unknown')}. "
+            "On NVIDIA: omit --skip_train and ensure CUDA + rasterizer installed. "
+            "Full quality uses --train_iters 30000 (smoke default 7000)."
+        )
+    elif train.get("ok"):
+        if train.get("point_cloud_written"):
+            lines.append("FastGS train wrote point_cloud — smoke OK.")
+        else:
+            lines.append(
+                "FastGS train finished but point_cloud not found — check train log "
+                "and --iterations / save_iterations."
+            )
+    elif train.get("ok") is False and not train.get("skipped"):
+        lines.append(
+            f"FastGS train failed (exit={train.get('exit_code')}). See run.log / "
+            "artifacts.logs."
+        )
+
+    if report.get("errors"):
+        lines.append(f"{len(report['errors'])} phase error(s) recorded — inspect phases.*.error.")
+
+    if not lines:
+        lines.append("No strong heuristics fired; review metrics manually.")
+
+    return " ".join(lines)
+
+
+def phase_hybrid_seed(args, out_dir: str, device: str) -> Dict[str, Any]:
+    from cf3dgs_bridge.export_colmap import export_solved_scene_to_colmap
+    from cf3dgs_bridge.hybrid_seeder import HybridPoseSeeder, HybridSeedConfig
+    from cf3dgs_bridge.tanks_loader import load_tanks_scene
+
+    t0 = time.perf_counter()
+    phase: Dict[str, Any] = {"ok": False, "seconds": 0.0, "stats": {}}
+    colmap_dir = os.path.join(out_dir, "colmap_export")
+    model_hint = os.path.join(out_dir, "fastgs_model")
+
+    ds, gt, depth_paths = load_tanks_scene(args.scene)
+    n_full = len(ds)
+    if args.max_frames and args.max_frames < len(ds):
+        ds.image_paths = ds.image_paths[: args.max_frames]
+        depth_paths = depth_paths[: args.max_frames]
+        if gt is not None:
+            gt = gt[: args.max_frames]
+
+    if not any(depth_paths):
+        raise RuntimeError(f"No DPT depth maps under {args.scene}/dpt; hybrid needs DepthPnP")
+
+    cfg = HybridSeedConfig(
+        sequential_radius=args.sequential_radius,
+        pair_radius=args.pair_radius,
+        long_range_stride=args.long_range_stride,
+        resize_width=args.resize_width if args.resize_width > 0 else None,
+        max_keypoints=args.max_keypoints,
+        feature_backend=args.feature_backend,
+        device=device,
+        pose_graph=not args.no_pose_graph,
+        depth_pnp_weight=args.depth_pnp_weight,
+        lightglue_weight=args.lightglue_weight,
+        scale_align=not args.no_scale_align,
+    )
+    seeder = HybridPoseSeeder(ds, depth_paths, cfg)
+    poses = seeder.solve()
+
+    # Count long-range-ish jumps (gap > sequential_radius)
+    n_lg = len(seeder.jump_edges)
+    n_long = sum(
+        1
+        for e in seeder.jump_edges
+        if (e.j - e.i) >= max(args.long_range_stride, args.sequential_radius + 1)
+    )
+
+    stats = {
+        "scene": os.path.basename(os.path.normpath(args.scene)),
+        "num_frames_full": n_full,
+        "num_frames": len(ds),
+        "backend": seeder.backend_name,
+        "used_lightglue": bool(seeder.used_lightglue),
+        "scale_ratio": float(seeder.scale_ratio),
+        "n_seq_edges": len(seeder.sequential_edges),
+        "n_lg_edges": n_lg,
+        "n_long_range": n_long,
+        "feature_backend": args.feature_backend,
+        "device": device,
+        "pose_graph": bool(cfg.pose_graph),
+        "has_gt": gt is not None,
+    }
+    phase["stats"] = stats
+    _write_json(os.path.join(out_dir, "seed_stats.json"), stats)
