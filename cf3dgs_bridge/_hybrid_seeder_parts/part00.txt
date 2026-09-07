@@ -1,0 +1,300 @@
+"""Hybrid pose seeder: metric DepthPnP for adjacent + LightGlue for long-range jumps.
+
+Product role
+------------
+DepthPnP gives metric scale from mono-depth on tight consecutive pairs, but
+cannot bridge large camera jumps. LightGlue recovers robust relative SE(3) on
+long-range pairs, but essential-matrix translations are unit-scale.
+
+This module:
+
+1. Builds sequential edges with DepthPnP (i→i+1, optional ±k).
+2. Builds long-range edges with LightGlue (stride / pair_radius beyond sequential).
+3. Scales LightGlue translations to the DepthPnP chain (median ratio vs composed
+   sequential path between the same endpoints).
+4. Fuses into one ``PoseSequence`` (prefer metric adjacent; scaled LightGlue for
+   jumps; optional pose-graph with higher weight on DepthPnP edges).
+
+Fallback: if LightGlue is unavailable, returns sequential-only DepthPnP.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+from .dataset import SequenceDataset
+from .depth_pnp_solver import (
+    DepthPnPProgressiveSolver,
+    DepthPnPSolveConfig,
+    load_depth_npz,
+    resize_depth,
+    unproject_pixels,
+)
+from .lightglue_seeder import (
+    LightGluePoseSeeder,
+    LightGlueSeedConfig,
+    ViewGraphEdge,
+    build_pairs,
+    lightglue_available,
+)
+from .opencv_solver import (
+    OpenCVSolveConfig,
+    _create_feature_backend,
+    _good_matches,
+    _load_gray,
+    _scaled_K,
+)
+from .pose_graph import (
+    PoseGraphEdge,
+    compose_relatives,
+    invert_T,
+    optimize_pose_graph,
+)
+from .pose_solver import PoseSequence, eye4
+
+Pair = Tuple[int, int]
+
+
+@dataclass
+class HybridSeedConfig:
+    """Config for DepthPnP (sequential) + LightGlue (jumps) fusion."""
+
+    sequential_backend: str = "depth_pnp"
+    jump_backend: str = "lightglue"
+    sequential_radius: int = 1
+    """DepthPnP pairs (i, i+d) for d = 1..sequential_radius (adjacent metric)."""
+
+    pair_radius: int = 2
+    """LightGlue sequential radius; only gaps > sequential_radius are kept as jumps."""
+
+    long_range_stride: int = 10
+    """Every-Nth long-range LightGlue pairs for large jumps."""
+
+    resize_width: Optional[int] = 960
+    max_keypoints: int = 2048
+    feature_backend: str = "superpoint"
+    device: str = "auto"
+    depth_feature_backend: str = "sift"
+    max_features: int = 4000
+    min_matches: int = 30
+    min_inliers: int = 15
+
+    pose_graph: bool = True
+    """SE3 pose-graph on fused edges (higher weight on DepthPnP)."""
+
+    depth_pnp_weight: float = 100.0
+    """Relative weight for metric DepthPnP edges in the pose graph."""
+
+    lightglue_weight: float = 0.05
+    """Base weight multiplier for scaled LightGlue jump edges (× inliers)."""
+
+    pose_graph_max_nfev: int = 100
+    scale_align: bool = True
+    """Median-ratio scale LightGlue translations to DepthPnP chain."""
+
+    scale_gap_prior: bool = True
+    """Multiply unit essential t by |j-i| before median-ratio alignment."""
+
+    min_jump_gap_for_pg: int = 0
+    """If > 0, only LightGlue edges with (j-i) >= this enter the pose-graph
+    (edges still kept on PoseSequence for export). 0 = use long_range_stride."""
+
+    require_lightglue: bool = False
+    """If True, raise when LightGlue cannot load; else sequential-only fallback."""
+
+
+def jump_pairs_only(
+    n: int,
+    sequential_radius: int = 1,
+    pair_radius: int = 2,
+    long_range_stride: int = 10,
+) -> List[Pair]:
+    """Pairs for LightGlue: all LG candidates with gap > sequential_radius."""
+    seq_r = max(0, int(sequential_radius))
+    all_pairs = build_pairs(n, pair_radius=max(1, int(pair_radius)), long_range_stride=long_range_stride)
+    return [(i, j) for i, j in all_pairs if (j - i) > seq_r]
+
+
+def compose_chain_relative(
+    adj_rels: Sequence[np.ndarray],
+    i: int,
+    j: int,
+) -> np.ndarray:
+    """Compose adjacent T_{k+1←k} from i to j into T_{j←i}."""
+    if j <= i:
+        raise ValueError(f"Need j > i, got i={i}, j={j}")
+    if j > len(adj_rels):
+        raise ValueError(f"j={j} exceeds chain length {len(adj_rels) + 1}")
+    return compose_relatives(adj_rels[i:j])
+
+
+def estimate_lightglue_scale_ratio(
+    adj_rels: Sequence[np.ndarray],
+    lightglue_edges: Sequence[ViewGraphEdge],
+    *,
+    min_t: float = 1e-6,
+) -> float:
+    """Median ||t_seq|| / ||t_lg|| over LightGlue edges that share endpoints with the chain.
+
+    ``adj_rels[k]`` is T_{(k+1)←k}. For edge (i, j) the composed sequential
+    relative is ``compose_relatives(adj_rels[i:j])``.
+
+    Call after ``apply_frame_gap_translation_prior`` so ||t_lg|| grows with |j-i|;
+    then one global median ratio recovers metric step length.
+    """
+    ratios: List[float] = []
+    n_frames = len(adj_rels) + 1
+    for e in lightglue_edges:
+        i, j = int(e.i), int(e.j)
+        if j <= i or j >= n_frames or i < 0:
+            continue
+        try:
+            T_seq = compose_chain_relative(adj_rels, i, j)
+        except ValueError:
+            continue
+        t_seq = float(np.linalg.norm(T_seq[:3, 3]))
+        t_lg = float(np.linalg.norm(np.asarray(e.T_j_i, dtype=np.float64)[:3, 3]))
+        if t_seq < min_t or t_lg < min_t:
+            continue
+        ratios.append(t_seq / t_lg)
+    if not ratios:
+        return 1.0
+    return float(np.median(np.asarray(ratios, dtype=np.float64)))
+
+
+def apply_frame_gap_translation_prior(
+    edges: Sequence[ViewGraphEdge],
+) -> List[ViewGraphEdge]:
+    """Scale each edge translation by |j-i| (constant-velocity prior on unit essential t)."""
+    out: List[ViewGraphEdge] = []
+    for e in edges:
+        gap = max(1, abs(int(e.j) - int(e.i)))
+        T = np.asarray(e.T_j_i, dtype=np.float64).copy()
+        T[:3, 3] = T[:3, 3] * float(gap)
+        out.append(
+            ViewGraphEdge(
+                i=e.i,
+                j=e.j,
+                T_j_i=T,
+                inliers=e.inliers,
+                num_matches=e.num_matches,
+            )
+        )
+    return out
+
+
+def scale_edge_translations(
+    edges: Sequence[ViewGraphEdge],
+    scale: float,
+) -> List[ViewGraphEdge]:
+    """Return copies of edges with translation vectors multiplied by ``scale``."""
+    s = float(scale)
+    out: List[ViewGraphEdge] = []
+    for e in edges:
+        T = np.asarray(e.T_j_i, dtype=np.float64).copy()
+        T[:3, 3] = T[:3, 3] * s
+        out.append(
+            ViewGraphEdge(
+                i=e.i,
+                j=e.j,
+                T_j_i=T,
+                inliers=e.inliers,
+                num_matches=e.num_matches,
+            )
+        )
+    return out
+
+
+def scale_align_lightglue_edges(
+    adj_rels: Sequence[np.ndarray],
+    lightglue_edges: Sequence[ViewGraphEdge],
+    *,
+    use_gap_prior: bool = True,
+) -> Tuple[List[ViewGraphEdge], float]:
+    """Gap-prior + median-ratio scale alignment. Returns (scaled_edges, median_ratio)."""
+    edges = list(lightglue_edges)
+    if use_gap_prior:
+        edges = apply_frame_gap_translation_prior(edges)
+    ratio = estimate_lightglue_scale_ratio(adj_rels, edges)
+    return scale_edge_translations(edges, ratio), ratio
+
+
+class HybridPoseSeeder:
+    """Fuse DepthPnP sequential metric VO with LightGlue long-range edges."""
+
+    def __init__(
+        self,
+        dataset: SequenceDataset,
+        depth_paths: List[Optional[str]],
+        cfg: Optional[HybridSeedConfig] = None,
+    ):
+        self.dataset = dataset
+        self.depth_paths = depth_paths
+        self.cfg = cfg or HybridSeedConfig()
+        if len(depth_paths) != len(dataset):
+            raise ValueError(
+                f"depth_paths length {len(depth_paths)} != num frames {len(dataset)}"
+            )
+        self.poses = PoseSequence(num_frames=len(dataset))
+        self.backend_name = "hybrid"
+        self.sequential_edges: List[ViewGraphEdge] = []
+        self.jump_edges: List[ViewGraphEdge] = []
+        self.scale_ratio: float = 1.0
+        self.used_lightglue: bool = False
+        self.adj_rels: List[np.ndarray] = []
+
+    def solve(self) -> PoseSequence:
+        n = len(self.dataset)
+        if n < 2:
+            raise ValueError("Need >= 2 frames")
+
+        cfg = self.cfg
+        if (cfg.sequential_backend or "depth_pnp").lower() != "depth_pnp":
+            raise ValueError(
+                f"Unsupported sequential_backend={cfg.sequential_backend!r} "
+                "(only depth_pnp is implemented)"
+            )
+
+        # --- 1) Sequential metric DepthPnP ---
+        adj_rels, seq_edges = self._build_sequential_edges()
+        self.adj_rels = adj_rels
+        self.sequential_edges = seq_edges
+        print(
+            f"[hybrid_seeder] Sequential DepthPnP: {len(adj_rels)} adjacent + "
+            f"{len(seq_edges) - len(adj_rels)} skip edges "
+            f"(radius={cfg.sequential_radius})"
+        )
+
+        # --- 2) Long-range LightGlue (optional fallback) ---
+        jump_edges: List[ViewGraphEdge] = []
+        jump_ok = (cfg.jump_backend or "lightglue").lower() == "lightglue"
+        lg_ready = jump_ok and lightglue_available(
+            "superpoint" if cfg.feature_backend in ("auto", "superpoint", "sift") else cfg.feature_backend
+        )
+        # Also allow SIFT fallback inside LightGluePoseSeeder
+        if jump_ok and not lg_ready and cfg.feature_backend == "sift":
+            lg_ready = True  # seeder will use SIFT path
+        if jump_ok and not lg_ready:
+            # Still try — LightGluePoseSeeder falls back to SIFT
+            lg_ready = True
+
+        if jump_ok and lg_ready:
+            try:
+                jump_edges = self._build_lightglue_jumps()
+                self.used_lightglue = True
+            except Exception as exc:
+                if cfg.require_lightglue:
+                    raise
+                print(
+                    f"[hybrid_seeder] LightGlue jumps failed ({exc}); "
+                    "falling back to sequential-only DepthPnP"
+                )
+                jump_edges = []
+                self.used_lightglue = False
+        else:
+            if cfg.require_lightglue:
+                raise RuntimeError("LightGlue unavailable and require_lightglue=True")
