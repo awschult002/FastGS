@@ -1,0 +1,252 @@
+        self.name = f"{fb}+lightglue"
+        self._feat_cache: Dict[str, dict] = {}
+
+    def _extract(self, path: str) -> Tuple[dict, float]:
+        key = path
+        if key in self._feat_cache:
+            return self._feat_cache[key], self._feat_cache[key]["_scale"]
+        # Prefer lightglue loader (RGB float); fall back to cv2
+        resize = self.cfg.resize_width
+        try:
+            from pathlib import Path as _Path
+
+            img_t = self.utils.load_image(_Path(path), resize=resize)
+            bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise FileNotFoundError(path)
+            orig_w = bgr.shape[1]
+            # CxHxW — width is last dim; scale K by width ratio
+            scale = float(img_t.shape[-1]) / float(orig_w)
+        except Exception:
+            bgr, scale = _load_bgr(path, resize)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            img_t = self.utils.numpy_image_to_torch(rgb)
+
+        img_t = img_t.to(self.device)
+        with self.torch.no_grad():
+            # Image already resized by load_image / cv2; disable SuperPoint auto-resize
+            try:
+                feats = self.extractor.extract(img_t, resize=None)
+            except TypeError:
+                feats = self.extractor.extract(img_t)
+        feats["_scale"] = scale
+        # Keep tensors on device for matcher; cache by path
+        self._feat_cache[key] = feats
+        return feats, scale
+
+    def match_pair(
+        self, path0: str, path1: str, K: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        feats0, _s0 = self._extract(path0)
+        feats1, _s1 = self._extract(path1)
+        f0_in = {k: v for k, v in feats0.items() if k != "_scale"}
+        f1_in = {k: v for k, v in feats1.items() if k != "_scale"}
+        with self.torch.no_grad():
+            matches01 = self.matcher({"image0": f0_in, "image1": f1_in})
+        f0 = self.utils.rbd(f0_in)
+        f1 = self.utils.rbd(f1_in)
+        m01 = self.utils.rbd(matches01)
+        matches = m01["matches"]
+        if matches is None or matches.numel() == 0:
+            return np.zeros((0, 2)), np.zeros((0, 2)), 0
+        matches_np = matches.detach().cpu().numpy()
+        if matches_np.ndim != 2 or matches_np.shape[0] < self.cfg.min_matches:
+            n = 0 if matches_np.ndim != 2 else matches_np.shape[0]
+            return np.zeros((0, 2)), np.zeros((0, 2)), int(n)
+        pts0 = f0["keypoints"][matches[..., 0]].detach().cpu().numpy().astype(np.float64)
+        pts1 = f1["keypoints"][matches[..., 1]].detach().cpu().numpy().astype(np.float64)
+        return pts0, pts1, int(pts0.shape[0])
+
+
+def _create_matcher(cfg: LightGlueSeedConfig):
+    """Prefer LightGlue; fall back to SIFT on any failure."""
+    device = resolve_device(cfg.device)
+    want = (cfg.feature_backend or "superpoint").lower().strip()
+    if want == "sift":
+        print("[lightglue_seeder] Using SIFT fallback (requested)")
+        return _SiftMatcher(cfg), device
+
+    tried = []
+    order = []
+    if want == "auto":
+        order = ["superpoint", "aliked"]
+    elif want == "aliked":
+        order = ["aliked", "superpoint"]
+    else:
+        order = ["superpoint"]
+
+    for fb in order:
+        if not lightglue_available(fb):
+            tried.append(f"{fb}:import_unavailable")
+            continue
+        try:
+            matcher = _LightGlueMatcher(cfg, device=device, backend_name=fb)
+            print(
+                f"[lightglue_seeder] Loaded {matcher.name} on device={device}"
+            )
+            return matcher, device
+        except Exception as exc:
+            tried.append(f"{fb}:{exc}")
+            print(f"[lightglue_seeder] Failed to init {fb}+LightGlue ({exc})")
+
+    print(
+        f"[lightglue_seeder] LightGlue unavailable ({tried}); falling back to SIFT"
+    )
+    return _SiftMatcher(cfg), device
+
+
+class LightGluePoseSeeder:
+    """Build a seeded PoseSequence from a learned-matching view graph."""
+
+    def __init__(self, dataset: SequenceDataset, cfg: Optional[LightGlueSeedConfig] = None):
+        self.dataset = dataset
+        self.cfg = cfg or LightGlueSeedConfig()
+        self.matcher, self.device = _create_matcher(self.cfg)
+        self.backend_name = getattr(self.matcher, "name", "unknown")
+        self.view_graph: List[ViewGraphEdge] = []
+        self.tree_edges: List[ViewGraphEdge] = []
+        self.poses = PoseSequence(num_frames=len(dataset))
+
+    def solve(self) -> PoseSequence:
+        n = len(self.dataset)
+        if n < 2:
+            raise ValueError("Need >= 2 frames")
+        pairs = build_pairs(n, self.cfg.pair_radius, self.cfg.long_range_stride)
+        print(
+            f"[lightglue_seeder] Seeding {n} frames, {len(pairs)} pairs "
+            f"(radius={self.cfg.pair_radius}, long_stride={self.cfg.long_range_stride}, "
+            f"backend={self.backend_name}, device={self.device})"
+        )
+
+        K_full = self.dataset.intrinsics.as_K()
+        edges: List[ViewGraphEdge] = []
+
+        for i, j in pairs:
+            path_i = self.dataset.image_paths[i]
+            path_j = self.dataset.image_paths[j]
+            # Approximate shared scale from resize_width vs original width
+            # Matcher returns keypoints in resized image coords; scale K accordingly.
+            probe = cv2.imread(path_i, cv2.IMREAD_COLOR)
+            if probe is None:
+                raise FileNotFoundError(path_i)
+            orig_w = probe.shape[1]
+            if self.cfg.resize_width is not None and orig_w > self.cfg.resize_width:
+                scale = self.cfg.resize_width / float(orig_w)
+            else:
+                scale = 1.0
+            K = _scaled_K(K_full, scale)
+
+            pts_i, pts_j, n_matches = self.matcher.match_pair(path_i, path_j, K)
+            if n_matches < self.cfg.min_matches or pts_i.shape[0] < self.cfg.min_matches:
+                print(
+                    f"[lightglue_seeder] {i:03d}→{j:03d} matches={n_matches} (skip)"
+                )
+                continue
+
+            T, n_inl = self._relative_pose(pts_i, pts_j, K)
+            if (
+                self.cfg.scale_t_by_frame_gap
+                and n_inl > 0
+                and abs(j - i) > 1
+            ):
+                T = T.copy()
+                T[:3, 3] = T[:3, 3] * float(abs(j - i))
+            tag = "ok" if n_inl >= self.cfg.min_inliers else "weak"
+            print(
+                f"[lightglue_seeder] {i:03d}→{j:03d} matches={n_matches} "
+                f"inliers={n_inl} ({tag}) t_norm={np.linalg.norm(T[:3, 3]):.4f}"
+            )
+            if n_inl > 0:
+                edges.append(
+                    ViewGraphEdge(
+                        i=i, j=j, T_j_i=T, inliers=int(n_inl), num_matches=int(n_matches)
+                    )
+                )
+
+        self.view_graph = edges
+        # Prefer strong edges for the tree; fall back to weaker to ensure connectivity
+        strong = [e for e in edges if e.inliers >= self.cfg.min_inliers]
+        tree = spanning_tree_edges(strong, n)
+        if len(tree) < n - 1:
+            weak = [e for e in edges if e.inliers < self.cfg.min_inliers]
+            # Re-run Kruskal on strong+weak so weak only fill gaps
+            tree = spanning_tree_edges(strong + weak, n)
+        self.tree_edges = tree
+        print(
+            f"[lightglue_seeder] View graph: {len(edges)} edges → "
+            f"spanning tree {len(tree)}/{n - 1}"
+        )
+
+        c2w = compose_poses_from_tree(n, tree, anchor=0)
+
+        if self.cfg.pose_graph and edges:
+            pg_edges = [
+                PoseGraphEdge(
+                    i=e.i,
+                    j=e.j,
+                    T_j_i=e.T_j_i,
+                    weight=float(max(e.inliers, 1)),
+                )
+                for e in edges
+                if e.inliers >= self.cfg.min_inliers
+            ]
+            if pg_edges:
+                try:
+                    c2w = optimize_pose_graph(
+                        c2w,
+                        pg_edges,
+                        max_nfev=self.cfg.pose_graph_max_nfev,
+                    )
+                    print(
+                        f"[lightglue_seeder] Pose-graph refine on {len(pg_edges)} edges"
+                    )
+                except Exception as exc:
+                    print(f"[lightglue_seeder] Pose-graph failed ({exc}); keeping tree")
+
+        self.poses = PoseSequence(num_frames=n)
+        self.poses.T_world_cam = [np.asarray(T, dtype=np.float64).copy() for T in c2w]
+        self.poses.set_identity_anchor(0)
+        # Store adjacent relatives for PoseSequence bookkeeping / export consumers
+        for i in range(n - 1):
+            T_ip1_i = invert_T(c2w[i + 1]) @ c2w[i]
+            self.poses.set_relative(i, i + 1, T_ip1_i)
+        # Also record non-adjacent view-graph edges
+        for e in edges:
+            if e.j != e.i + 1:
+                self.poses.set_relative(e.i, e.j, e.T_j_i)
+        return self.poses
+
+    def _relative_pose(
+        self, pts1: np.ndarray, pts2: np.ndarray, K: np.ndarray
+    ) -> Tuple[np.ndarray, int]:
+        E, mask = cv2.findEssentialMat(
+            pts1,
+            pts2,
+            cameraMatrix=K,
+            method=cv2.RANSAC,
+            prob=self.cfg.ransac_prob,
+            threshold=self.cfg.ransac_threshold,
+        )
+        if E is None or mask is None:
+            return eye4(), 0
+        n_pose, R, t, mask_pose = recover_pose_opencv5(E, pts1, pts2, K, mask=mask)
+        inliers = int(n_pose) if n_pose else (
+            int(mask_pose.sum()) if mask_pose is not None else 0
+        )
+        T = eye4()
+        T[:3, :3] = R
+        T[:3, 3] = t.reshape(3)
+        return T, inliers
+
+
+# Re-export for tests / CLI
+__all__ = [
+    "LightGlueSeedConfig",
+    "LightGluePoseSeeder",
+    "ViewGraphEdge",
+    "build_pairs",
+    "spanning_tree_edges",
+    "compose_poses_from_tree",
+    "lightglue_available",
+    "resolve_device",
+]
